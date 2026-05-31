@@ -892,7 +892,7 @@ canvas { display: block; }
 
 
 <!-- Phase 2: CSV file input (global, triggered programmatically) -->
-<input type="file" id="csv-input" accept=".csv,.txt,.xls" style="display:none"
+<input type="file" id="csv-input" accept=".csv,.txt,.xls,.pdf" style="display:none"
        onchange="Screens.import.handleFile(event)">
 
 
@@ -3410,6 +3410,369 @@ const BankParser = (() => {
 
 
 /* ═══════════════════════════════════════════════════════════
+   PDF PARSER — offline PDF statement extraction via PDF.js
+   Supports: HDFC/ICICI/Axis/SBI savings + HDFC/ICICI/Axis/Scapia credit cards
+   ═════════════════════════════════════════════════════════ */
+const PDFParser = (() => {
+  let _libLoaded = false;
+  const PDFJS_SRC    = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+  const PDFJS_WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+  async function _load() {
+    if (_libLoaded || window.pdfjsLib) { _libLoaded = true; return; }
+    await new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = PDFJS_SRC;
+      s.onload = res; s.onerror = rej;
+      document.head.appendChild(s);
+    });
+    pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
+    _libLoaded = true;
+  }
+
+  // Extract structured rows [{y, page, items:[{str,x,w}], text}] from all pages
+  async function _getRows(file) {
+    const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+    const all = [];
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const tc   = await page.getTextContent();
+      const items = tc.items
+        .filter(i => i.str && i.str.trim())
+        .map(i => ({ str: i.str.trim(), x: i.transform[4], y: i.transform[5], w: i.width || 0 }));
+
+      // Group items into rows by y-coordinate (±3pt tolerance)
+      const buckets = new Map();
+      for (const it of items) {
+        let key = null;
+        for (const k of buckets.keys()) { if (Math.abs(k - it.y) <= 3) { key = k; break; } }
+        if (key === null) { key = it.y; buckets.set(key, []); }
+        buckets.get(key).push(it);
+      }
+
+      const rows = [...buckets.entries()]
+        .sort(([a], [b]) => b - a)   // descending y = top-to-bottom
+        .map(([y, its]) => {
+          const sorted = [...its].sort((a, b) => a.x - b.x);
+          return { y, page: p, items: sorted, text: sorted.map(i => i.str).join(' ') };
+        })
+        .filter(r => r.text.trim().length > 0);
+      all.push(...rows);
+    }
+    return all;
+  }
+
+  // ─── Parsers for date / amount strings ────────────────
+  const MO = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+  function _pd(s) {
+    if (!s) return null;
+    s = String(s).trim();
+    let m;
+    m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+    if (m) { const y = m[3].length === 2 ? '20'+m[3] : m[3]; return `${y}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`; }
+    m = s.match(/^(\d{1,2})[\s\-]([A-Za-z]{3})[\s\-](\d{4})$/);
+    if (m) { const mo = MO[m[2].toLowerCase()]; if (mo) return `${m[3]}-${mo}-${m[1].padStart(2,'0')}`; }
+    m = s.match(/^([A-Za-z]{3})\s+(\d{1,2})[,\s]+(\d{4})$/);
+    if (m) { const mo = MO[m[1].toLowerCase()]; if (mo) return `${m[3]}-${mo}-${m[2].padStart(2,'0')}`; }
+    return null;
+  }
+
+  function _pa(s) {
+    if (!s) return null;
+    const v = parseFloat(String(s).replace(/[₹,\s]/g, ''));
+    return isNaN(v) ? null : v;
+  }
+
+  // ─── Column helpers ────────────────────────────────────
+  // Find the first row index whose text contains ≥ minMatch of the given keywords
+  function _findHdrIdx(rows, keywords, minMatch) {
+    const KW = keywords.map(k => k.toUpperCase());
+    minMatch = minMatch || KW.length;
+    for (let i = 0; i < Math.min(rows.length, 80); i++) {
+      const u = rows[i].text.toUpperCase();
+      if (KW.filter(k => u.includes(k)).length >= minMatch) return i;
+    }
+    return -1;
+  }
+
+  // Build column descriptors from a header row's items
+  function _colRanges(hdrRow) {
+    const its = hdrRow.items;
+    return its.map((it, i) => ({
+      name:    it.str.toUpperCase().trim(),
+      xCenter: it.x + it.w / 2,
+      xMin:    i === 0 ? -Infinity : (its[i-1].x + its[i-1].w + it.x) / 2,
+      xMax:    i === its.length-1 ? Infinity : (it.x + it.w + its[i+1].x) / 2,
+    }));
+  }
+
+  // Assign each item in a data row to the nearest column
+  function _assign(cols, dataRow) {
+    const r = {};
+    for (const c of cols) r[c.name] = '';
+    for (const it of dataRow.items) {
+      const best = cols.reduce((a, b) =>
+        Math.abs(a.xCenter - it.x) <= Math.abs(b.xCenter - it.x) ? a : b);
+      r[best.name] = (r[best.name] + ' ' + it.str).trim();
+    }
+    return r;
+  }
+
+  // Return value of first column whose name includes any of the given keywords
+  function _cv(d, ...keys) {
+    const found = Object.keys(d).find(k => keys.some(kw => k.toUpperCase().includes(kw.toUpperCase())));
+    return found ? d[found] : '';
+  }
+
+  const DATE_LINE_RE = /\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b|\b\d{1,2}\s[A-Za-z]{3}\s\d{4}\b/;
+
+  // ─── Bank detection ────────────────────────────────────
+  function _detect(rows) {
+    const head = rows.slice(0, 50).map(r => r.text).join(' ').toLowerCase();
+    if (head.includes('hdfc bank') || head.includes('hdfcbank')) {
+      if (head.includes('credit card') || head.includes('statement of credit'))
+        return { bank:'HDFC Bank', stmtType:'credit', fn:_hdfcCredit };
+      return { bank:'HDFC Bank', stmtType:'savings', fn:_hdfcSavings };
+    }
+    if (head.includes('icici bank')) {
+      if (head.includes('credit card'))
+        return { bank:'ICICI Bank', stmtType:'credit', fn:_iciciCredit };
+      return { bank:'ICICI Bank', stmtType:'savings', fn:_iciciSavings };
+    }
+    if (head.includes('axis bank')) {
+      if (head.includes('credit card'))
+        return { bank:'Axis Bank', stmtType:'credit', fn:_axisCredit };
+      return { bank:'Axis Bank', stmtType:'savings', fn:_axisSavings };
+    }
+    if (head.includes('state bank of india') || (head.includes('state bank') && head.includes('sbi')))
+      return { bank:'SBI', stmtType:'savings', fn:_sbi };
+    if (head.includes('scapia') || (head.includes('federal bank') && head.includes('credit card')))
+      return { bank:'Scapia', stmtType:'credit', fn:_scapia };
+    return { bank:'Unknown', stmtType:'savings', fn:_genericPDF };
+  }
+
+  // ─── HDFC Savings PDF ──────────────────────────────────
+  // Date | Narration | Chq/Ref | Value Dt | Withdrawal Amt | Deposit Amt | Balance
+  function _hdfcSavings(rows) {
+    const hi = _findHdrIdx(rows, ['NARRATION','WITHDRAWAL','DEPOSIT'], 2);
+    if (hi < 0) return _genericPDF(rows);
+    const cols = _colRanges(rows[hi]);
+    const txns = [];
+    for (let i = hi+1; i < rows.length; i++) {
+      const row = rows[i];
+      if (!DATE_LINE_RE.test(row.text)) continue;
+      const d    = _assign(cols, row);
+      const date = _pd(_cv(d,'DATE'));
+      if (!date) continue;
+      const desc = _cv(d,'NARRATION','DESCRIPTION');
+      const dr   = _pa(_cv(d,'WITHDRAWAL','DR'));
+      const cr   = _pa(_cv(d,'DEPOSIT','CR'));
+      if (dr && dr > 0) txns.push({ date, description: desc, amount: dr, type:'expense' });
+      if (cr && cr > 0) txns.push({ date, description: desc, amount: cr, type:'income' });
+    }
+    return txns;
+  }
+
+  // ─── HDFC Credit Card PDF ──────────────────────────────
+  // Date | Transaction Description | Reward Pts | Intl Amt | Amount(INR)  [Cr suffix = refund]
+  function _hdfcCredit(rows) {
+    const hi = _findHdrIdx(rows, ['DATE','AMOUNT'], 2);
+    if (hi < 0) return _genericPDF(rows);
+    const cols = _colRanges(rows[hi]);
+    const txns = [];
+    for (let i = hi+1; i < rows.length; i++) {
+      const row = rows[i];
+      if (!DATE_LINE_RE.test(row.text)) continue;
+      const d      = _assign(cols, row);
+      const date   = _pd(_cv(d,'DATE'));
+      if (!date) continue;
+      const amtStr = _cv(d,'AMOUNT');
+      const amt    = _pa(amtStr.replace(/[Cc][Rr]|[Dd][Rr]/g,''));
+      if (!amt) continue;
+      const desc   = _cv(d,'DESCRIPTION','DETAILS','NARRATION','PARTICULAR');
+      const isCr   = /\bCr\b/i.test(amtStr) || /CREDIT|REFUND|REVERSAL|CASHBACK/i.test(row.text);
+      txns.push({ date, description: desc, amount: Math.abs(amt), type: isCr ? 'income' : 'expense' });
+    }
+    return txns;
+  }
+
+  // ─── ICICI Savings PDF ─────────────────────────────────
+  // S No | Value Date | Transaction Date | Cheque No | Remarks | Withdrawal | Deposit | Balance
+  function _iciciSavings(rows) {
+    const hi = _findHdrIdx(rows, ['WITHDRAWAL','DEPOSIT'], 2);
+    if (hi < 0) return _genericPDF(rows);
+    const cols = _colRanges(rows[hi]);
+    const txns = [];
+    for (let i = hi+1; i < rows.length; i++) {
+      const row = rows[i];
+      if (!DATE_LINE_RE.test(row.text)) continue;
+      const d       = _assign(cols, row);
+      const dateStr = _cv(d,'TRANSACTION DATE','DATE');
+      const date    = _pd(dateStr) || (() => { const m = row.text.match(DATE_LINE_RE); return m ? _pd(m[0]) : null; })();
+      if (!date) continue;
+      const desc = _cv(d,'REMARKS','NARRATION','DESCRIPTION');
+      const dr   = _pa(_cv(d,'WITHDRAWAL'));
+      const cr   = _pa(_cv(d,'DEPOSIT'));
+      if (dr && dr > 0) txns.push({ date, description: desc, amount: dr, type:'expense' });
+      if (cr && cr > 0) txns.push({ date, description: desc, amount: cr, type:'income' });
+    }
+    return txns;
+  }
+
+  // ─── ICICI Credit Card PDF ─────────────────────────────
+  // Date | Transaction Description | Amount (INR)  [Dr/Cr suffix]
+  function _iciciCredit(rows) {
+    const hi = _findHdrIdx(rows, ['DATE','DESCRIPTION','AMOUNT'], 2);
+    if (hi < 0) return _genericPDF(rows);
+    const cols = _colRanges(rows[hi]);
+    const txns = [];
+    for (let i = hi+1; i < rows.length; i++) {
+      const row = rows[i];
+      if (!DATE_LINE_RE.test(row.text)) continue;
+      const d      = _assign(cols, row);
+      const date   = _pd(_cv(d,'DATE'));
+      if (!date) continue;
+      const amtStr = _cv(d,'AMOUNT');
+      const amt    = _pa(amtStr.replace(/[Cc][Rr]|[Dd][Rr]/g,''));
+      if (!amt) continue;
+      const desc   = _cv(d,'DESCRIPTION','NARRATION','PARTICULAR');
+      const isCr   = /\bCr\b/i.test(amtStr) || /CREDIT|REFUND|REVERSAL|CASHBACK/i.test(row.text);
+      txns.push({ date, description: desc, amount: Math.abs(amt), type: isCr ? 'income' : 'expense' });
+    }
+    return txns;
+  }
+
+  // ─── Axis Savings PDF ──────────────────────────────────
+  // Tran Date | Chq No | PARTICULARS | DR | CR | Balance
+  function _axisSavings(rows) {
+    const hi = _findHdrIdx(rows, ['PARTICULARS','DR'], 2);
+    if (hi < 0) return _genericPDF(rows);
+    const cols = _colRanges(rows[hi]);
+    const txns = [];
+    for (let i = hi+1; i < rows.length; i++) {
+      const row = rows[i];
+      if (!DATE_LINE_RE.test(row.text)) continue;
+      const d    = _assign(cols, row);
+      const date = _pd(_cv(d,'DATE'));
+      if (!date) continue;
+      const desc = _cv(d,'PARTICULAR','NARRATION');
+      const dr   = _pa(_cv(d,'DR','DEBIT','WITHDRAWAL'));
+      const cr   = _pa(_cv(d,'CR','CREDIT','DEPOSIT'));
+      if (dr && dr > 0) txns.push({ date, description: desc, amount: dr, type:'expense' });
+      if (cr && cr > 0) txns.push({ date, description: desc, amount: cr, type:'income' });
+    }
+    return txns;
+  }
+
+  // ─── Axis Credit Card PDF ──────────────────────────────
+  // Transaction Date | Transaction Details | Amount (INR)  [Dr/Cr]
+  function _axisCredit(rows) {
+    const hi = _findHdrIdx(rows, ['DATE','AMOUNT'], 2);
+    if (hi < 0) return _genericPDF(rows);
+    const cols = _colRanges(rows[hi]);
+    const txns = [];
+    for (let i = hi+1; i < rows.length; i++) {
+      const row = rows[i];
+      if (!DATE_LINE_RE.test(row.text)) continue;
+      const d      = _assign(cols, row);
+      const date   = _pd(_cv(d,'DATE'));
+      if (!date) continue;
+      const amtStr = _cv(d,'AMOUNT');
+      const amt    = _pa(amtStr.replace(/[Cc][Rr]|[Dd][Rr]/g,''));
+      if (!amt) continue;
+      const desc   = _cv(d,'DETAIL','DESCRIPTION','PARTICULAR','NARRATION');
+      const isCr   = /\bCr\b/i.test(amtStr) || /CREDIT|REFUND|REVERSAL|CASHBACK/i.test(row.text);
+      txns.push({ date, description: desc, amount: Math.abs(amt), type: isCr ? 'income' : 'expense' });
+    }
+    return txns;
+  }
+
+  // ─── SBI Savings PDF ───────────────────────────────────
+  // Txn Date | Value Date | Description | Ref No | Debit | Credit | Balance
+  function _sbi(rows) {
+    const hi = _findHdrIdx(rows, ['DESCRIPTION','DEBIT','CREDIT'], 2);
+    if (hi < 0) return _genericPDF(rows);
+    const cols = _colRanges(rows[hi]);
+    const txns = [];
+    for (let i = hi+1; i < rows.length; i++) {
+      const row = rows[i];
+      if (!DATE_LINE_RE.test(row.text)) continue;
+      const d       = _assign(cols, row);
+      const dateStr = _cv(d,'TXN DATE','TRANSACTION DATE','DATE');
+      const date    = _pd(dateStr) || (() => { const m = row.text.match(DATE_LINE_RE); return m ? _pd(m[0]) : null; })();
+      if (!date) continue;
+      const desc = _cv(d,'DESCRIPTION','NARRATION','PARTICULAR');
+      const dr   = _pa(_cv(d,'DEBIT'));
+      const cr   = _pa(_cv(d,'CREDIT'));
+      if (dr && dr > 0) txns.push({ date, description: desc, amount: dr, type:'expense' });
+      if (cr && cr > 0) txns.push({ date, description: desc, amount: cr, type:'income' });
+    }
+    return txns;
+  }
+
+  // ─── Scapia Credit Card PDF ────────────────────────────
+  function _scapia(rows) {
+    const hi = _findHdrIdx(rows, ['DATE','AMOUNT'], 2);
+    if (hi < 0) return _genericPDF(rows);
+    const cols = _colRanges(rows[hi]);
+    const txns = [];
+    for (let i = hi+1; i < rows.length; i++) {
+      const row = rows[i];
+      if (!DATE_LINE_RE.test(row.text)) continue;
+      const d       = _assign(cols, row);
+      const date    = _pd(_cv(d,'DATE'));
+      if (!date) continue;
+      const amtStr  = _cv(d,'AMOUNT');
+      const amt     = _pa(amtStr.replace(/[Cc][Rr]|[Dd][Rr]/g,''));
+      if (!amt) continue;
+      const desc    = _cv(d,'DESCRIPTION','MERCHANT','DETAIL','NARRATION');
+      const typeStr = _cv(d,'TYPE','DR','CR');
+      const isCr    = /\bCr\b/i.test(amtStr) || /CR|CREDIT|REFUND/i.test(typeStr) || /REVERSAL|CASHBACK/i.test(row.text);
+      txns.push({ date, description: desc, amount: Math.abs(amt), type: isCr ? 'income' : 'expense' });
+    }
+    return txns;
+  }
+
+  // ─── Generic PDF fallback ──────────────────────────────
+  // Finds any row containing a date + amount and treats it as a transaction
+  function _genericPDF(rows) {
+    const txns = [];
+    for (const row of rows) {
+      const dateMatch = row.text.match(DATE_LINE_RE);
+      if (!dateMatch) continue;
+      const date = _pd(dateMatch[0]);
+      if (!date) continue;
+      const amounts = (row.text.match(/[\d,]+\.\d{2}/g) || [])
+        .map(m => parseFloat(m.replace(/,/g,'')))
+        .filter(v => v > 0);
+      if (!amounts.length) continue;
+      const desc = row.text.replace(DATE_LINE_RE,'').replace(/[\d,]+\.\d{2}/g,'').trim();
+      txns.push({ date, description: desc || row.text, amount: amounts[0], type:'expense' });
+    }
+    return txns;
+  }
+
+  // ─── Public API ────────────────────────────────────────
+  async function parse(file) {
+    try { await _load(); }
+    catch { return { error: 'Could not load PDF library. Check your internet connection and try again.', txns: [] }; }
+
+    let rows;
+    try { rows = await _getRows(file); }
+    catch (e) { return { error: 'Could not read PDF: ' + e.message, txns: [] }; }
+
+    if (!rows.length) return { error: 'PDF has no extractable text. Scanned/image PDFs are not supported — please use a digital statement PDF.', txns: [] };
+
+    const det  = _detect(rows);
+    const txns = det.fn(rows).filter(t => t.date && t.amount > 0 && t.description.trim().length > 0);
+    return { bank: det.bank, stmtType: det.stmtType, txns, total: txns.length };
+  }
+
+  return { parse };
+})();
+
+
+/* ═══════════════════════════════════════════════════════════
    PHASE 2 — IMPORT SCREEN
    ═════════════════════════════════════════════════════════ */
 Screens.import = {
@@ -3433,10 +3796,10 @@ Screens.import = {
            ondragleave="this.classList.remove('drag-over')"
            ondrop="this.classList.remove('drag-over');Screens.import.handleDrop(event)">
         <div class="upload-zone-icon">📄</div>
-        <div class="upload-zone-title">Tap to upload CSV statement</div>
+        <div class="upload-zone-title">Tap to upload bank statement</div>
         <div class="upload-zone-sub">HDFC · ICICI · Axis · SBI · Scapia</div>
         <div class="upload-zone-sub" style="margin-top:4px;font-size:11px;color:var(--tx3)">
-          Auto-detects bank &amp; statement type · Duplicates skipped automatically
+          PDF &amp; CSV supported · Auto-detects bank · Duplicates skipped
         </div>
       </div>
 
@@ -3460,7 +3823,7 @@ Screens.import = {
             </div>
           </div>`).join('')}
         <div style="padding:12px 0 4px;font-size:12px;color:var(--tx3);line-height:1.6">
-          💡 Export CSV from your bank's net banking portal or mobile app.<br>
+          💡 Download PDF or CSV statements from your bank's app or net banking portal.<br>
           It's safe to re-upload — duplicate transactions are detected and skipped.
         </div>
       </div>
@@ -3502,8 +3865,10 @@ Screens.import = {
       </div>`;
 
     try {
-      const text   = await file.text();
-      const result = BankParser.parse(text);
+      const isPDF  = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+      const result = isPDF
+        ? await PDFParser.parse(file)
+        : BankParser.parse(await file.text());
 
       if (result.error || result.txns.length === 0) {
         UI.toast(result.error || 'No transactions found in file', 'error');

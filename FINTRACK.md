@@ -6,17 +6,46 @@ A 100% offline personal finance tracker built as a single-file Progressive Web A
 
 ## Table of Contents
 
-1. [Project Overview](#project-overview)
-2. [Tech Stack](#tech-stack)
-3. [Architecture](#architecture)
-4. [Feature Phases](#feature-phases)
-5. [Database Schema](#database-schema)
-6. [Key Algorithms](#key-algorithms)
-7. [UI / Design System](#ui--design-system)
-8. [PWA Capabilities](#pwa-capabilities)
-9. [File Structure](#file-structure)
-10. [Deployment](#deployment)
-11. [Development Notes](#development-notes)
+1. [Project Genesis](#project-genesis)
+2. [Project Overview](#project-overview)
+3. [Tech Stack](#tech-stack)
+4. [Architecture](#architecture)
+5. [Feature Phases](#feature-phases)
+6. [Database Schema](#database-schema)
+7. [Key Algorithms](#key-algorithms)
+8. [UI / Design System](#ui--design-system)
+9. [PWA Capabilities](#pwa-capabilities)
+10. [File Structure](#file-structure)
+11. [Deployment](#deployment)
+12. [Development Notes](#development-notes)
+
+---
+
+## Project Genesis
+
+The original requirements that shaped every design decision:
+
+> "Can you create a free application (without any external subscriptions) to track my monthly expenses on my current iOS device?
+>
+> 1. It should not connect to the internet in any sense and should be completely offline (or be extremely secure, but completely offline is 1st preference), since I am tracking my finances.
+> 2. It should track all my expenses across all my bank accounts.
+> 3. It should also generate reports on demand about my spends, savings, and investments. The requirements or parameters to these reports should be extremely configurable and easily extendable.
+> 4. It should understand where my money has gone — for example, any transaction on Zepto shows up as something else such as 'kiranakart' or similar. The system should understand what each transaction is and raise transactions that can't be identified so that I can tag them manually (preferably with a dropdown or options list)."
+
+These requirements drove four key architectural choices:
+
+| Requirement | Decision |
+|-------------|----------|
+| Completely offline | IndexedDB + Service Worker; no network calls |
+| All bank accounts | Multi-account model, per-account balance tracking |
+| Configurable reports | 6 report types, configurable date window + account filter, CSV export |
+| Merchant identification | 3-tier MerchantEngine (user rules → dictionary → fuzzy match) + Review Queue for unknowns |
+
+**Why a PWA instead of a native iOS app?**
+A native app would require App Store submission and a developer account ($99/yr). A PWA hosted on GitHub Pages is free, installable via Safari's "Add to Home Screen", and behaves identically to a native app once installed.
+
+**Safari / GitHub Pages constraint:**
+Safari on iOS cannot open local HTML files directly from the filesystem. The app is hosted on GitHub Pages (free static hosting) so it can be accessed via a URL in Safari and installed as a home-screen PWA. After the first load, the Service Worker caches all assets — the app works fully offline from that point on.
 
 ---
 
@@ -47,6 +76,7 @@ Fintrack is a mobile-first personal finance app for tracking expenses, income, i
 | Storage | IndexedDB | All user data, offline-first |
 | Styling | Custom CSS with design tokens | No Tailwind / Bootstrap |
 | Charts | Native Canvas 2D API | No Chart.js or D3 |
+| PDF parsing | PDF.js 3.11 (Mozilla) | Loaded from CDN, cached by SW for offline use |
 | Security | Web Crypto API (SHA-256) | PIN hashing |
 | PWA | Service Worker + Web Manifest | Offline cache, home-screen install |
 
@@ -152,6 +182,35 @@ Output: `{ bank, stmtType, txns[], total }`
 
 Date parsing handles: `DD/MM/YYYY`, `MMM DD YYYY`, `DD-MM-YYYY`.
 
+### PDFParser
+
+Offline PDF statement parser powered by [PDF.js](https://mozilla.github.io/pdf.js/) (Mozilla). PDF.js is loaded from CDN on first use and pre-cached by the Service Worker — subsequent imports work fully offline.
+
+**Why PDFs?** All Indian banks and credit cards issue statements in PDF format. CSV export is buried in net banking portals and not available at all for many credit cards.
+
+**Supported formats:**
+
+| Bank | Savings Account | Credit Card |
+|------|:-:|:-:|
+| HDFC | ✓ | ✓ |
+| ICICI | ✓ | ✓ |
+| Axis | ✓ | ✓ |
+| SBI | ✓ | — |
+| Scapia | — | ✓ |
+
+**Limitation:** Image-based / scanned PDFs are not supported — only digital PDFs that contain real text layers.
+
+**How it works:**
+
+1. PDF.js extracts all text items from every page. Each item carries an (x, y) coordinate in PDF user space.
+2. Items are grouped into rows by y-coordinate (±3 pt tolerance), sorted top-to-bottom.
+3. The bank is auto-detected by scanning the first 50 rows for bank name strings.
+4. The header row is found by keyword matching (e.g. `NARRATION + WITHDRAWAL` → HDFC Savings).
+5. Each header item's x-position becomes a column centre. Data items in subsequent rows are assigned to the nearest column by x-distance.
+6. Date, description, debit, and credit columns are extracted and normalised into the same `{ date, description, amount, type }` format as CSV imports.
+
+Output: same `{ bank, stmtType, txns[], total }` shape as BankParser — the rest of the import pipeline is identical.
+
 ### Charts
 
 All charts rendered to `<canvas>` — no external library.
@@ -192,11 +251,12 @@ All charts rendered to `<canvas>` — no external library.
 ### Phase 2 — Import & Auto-Categorization
 
 **New screens:**
-- **Import** — CSV upload (drag-drop or file picker), bank auto-detect, preview table, deduplication report
+- **Import** — PDF/CSV upload (drag-drop or file picker), bank auto-detect, preview table, deduplication report
 - **Review Queue** — Unresolved transactions needing manual category tag; "apply to all similar" bulk-rule creation
 
 **Features:**
-- Parse 5 bank formats
+- Parse PDF statements from HDFC, ICICI, Axis, SBI, Scapia (savings + credit card)
+- Parse CSV statements from the same banks (fallback / net banking export)
 - Merchant auto-categorization via MerchantEngine
 - Transaction deduplication: hash = `date|amount|description`, skip already-seen hashes
 - User merchant mappings saved to DB (`mappings` store)
@@ -422,20 +482,21 @@ The Service Worker uses a cache-first strategy — network is never required aft
 
 ```
 fintrack/
-├── index.html          # Entire app (~5,400 lines)
+├── index.html          # Entire app (~5,600 lines)
 │   ├── <style>         # CSS design system (~784 lines)
-│   └── <script>        # All JS modules (~4,600 lines)
+│   └── <script>        # All JS modules (~4,800 lines)
 │       ├── DB          # IndexedDB wrapper
 │       ├── State       # Reactive state store
 │       ├── Utils       # Date / format helpers
 │       ├── CATS        # Category definitions
 │       ├── MerchantEngine  # Auto-categorization
-│       ├── BankParser  # CSV parser
+│       ├── BankParser  # CSV parser (all banks)
+│       ├── PDFParser   # PDF parser via PDF.js (all banks)
 │       ├── Charts      # Canvas chart renderers
 │       ├── UI          # Toast / modal helpers
 │       └── Screen renders (dash, txns, accounts, reports, import, review, settings)
 ├── manifest.json       # PWA manifest
-├── service-worker.js   # Offline cache
+├── service-worker.js   # Offline cache (v2 — includes PDF.js CDN URLs)
 ├── icon-192.png        # App icon (small)
 ├── icon-512.png        # App icon (large)
 ├── README.txt          # Deployment guide
@@ -460,6 +521,15 @@ Drag-drop the project folder into [netlify.com/drop](https://netlify.com/drop) �
 ### Local
 
 Open `index.html` directly in any modern browser. Service Worker requires a server origin (localhost or HTTPS) to activate, but all core features work via `file://`.
+
+### iOS / Safari note
+
+Safari on iOS **cannot open local HTML files** from the Files app. This is why GitHub Pages (or Netlify) is required — it provides an HTTPS origin so Safari can:
+1. Load the app normally
+2. Activate the Service Worker (which then caches everything for offline use)
+3. Offer "Add to Home Screen" for native-app-like installation
+
+Once installed and cached, the app works fully offline with no internet connection needed.
 
 ---
 
@@ -500,3 +570,21 @@ Add an entry to the built-in dictionary in `MerchantEngine`:
 ### No Build Step
 
 There is intentionally no bundler, transpiler, or package manager. All features use browser-native APIs available in Chrome 90+, Firefox 90+, Safari 15+. Edit `index.html` directly and reload.
+
+### Adding a New Bank PDF Format
+
+1. Add a detection branch in `PDFParser._detect()` — match the bank name from the first 50 rows of text.
+2. Write a parse function `_myBank(rows)` following the same pattern as the existing ones:
+   - Call `_findHdrIdx(rows, ['KEYWORD1','KEYWORD2'], 2)` to find the header row
+   - Call `_colRanges(rows[hi])` to get column descriptors
+   - Loop rows, skip non-date rows, call `_assign(cols, row)` and `_cv(d, ...)` to read columns
+   - Push `{ date, description, amount, type }` objects
+3. Register the function in `_detect()`.
+4. Update the service worker cache version if you bump anything that needs re-caching.
+
+### PDF.js Offline Behaviour
+
+PDF.js (`pdf.min.js` + `pdf.worker.min.js`) is loaded from the cdnjs CDN. The Service Worker pre-caches both files during its `install` event. After the first load:
+- Both files are in the browser cache
+- PDF parsing works fully offline
+- If the cache is cleared, PDF parsing requires one internet request to re-fetch PDF.js
