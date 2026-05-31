@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -1726,7 +1726,7 @@ const UI = (() => {
  */
 function renderTxRow(tx) {
   const cat  = CATS.get(tx.categoryId);
-  const sign = tx.type === 'income' ? '+' : '−';
+  const sign = tx.type === 'income' ? '+' : tx.type === 'transfer' ? '⇄' : '−';
   const col  = { expense: 'col-expense', income: 'col-income', investment: 'col-investment', transfer: 'col-transfer' }[tx.type] || 'col-expense';
 
   // PHASE_2_HOOK: tx.status === 'unreviewed' → show warning badge on icon
@@ -2079,12 +2079,17 @@ Screens.tx = {
       ).join('');
     }
 
+    const accOptionsTo = State.accounts
+      .map(a => `<option value="${a.id}">${escHtml(a.name)}</option>`)
+      .join('');
+
     document.getElementById('modal-tx-body').innerHTML = `
       <div class="form-group">
         <div class="segmented" id="tx-type-seg">
-          <div class="seg-btn active" data-type="expense"  onclick="Screens.tx._switchType('expense', this)">Expense</div>
-          <div class="seg-btn"       data-type="income"    onclick="Screens.tx._switchType('income', this)">Income</div>
-          <div class="seg-btn"       data-type="investment" onclick="Screens.tx._switchType('investment', this)">Invest</div>
+          <div class="seg-btn active" data-type="expense"    onclick="Screens.tx._switchType('expense', this)">Expense</div>
+          <div class="seg-btn"       data-type="income"      onclick="Screens.tx._switchType('income', this)">Income</div>
+          <div class="seg-btn"       data-type="investment"  onclick="Screens.tx._switchType('investment', this)">Invest</div>
+          <div class="seg-btn"       data-type="transfer"    onclick="Screens.tx._switchType('transfer', this)">Transfer</div>
         </div>
         <input type="hidden" id="tx-type-val" value="expense">
       </div>
@@ -2105,7 +2110,7 @@ Screens.tx = {
       </div>
 
       <div class="form-group">
-        <label class="form-label">Account</label>
+        <label class="form-label" id="tx-account-label">Account</label>
         <select class="form-select" id="tx-account">
           ${State.accounts.length === 0
             ? '<option value="">No accounts — add one first</option>'
@@ -2113,7 +2118,14 @@ Screens.tx = {
         </select>
       </div>
 
-      <div class="form-group">
+      <div class="form-group" id="tx-to-account-group" style="display:none">
+        <label class="form-label">To Account</label>
+        <select class="form-select" id="tx-to-account">
+          <option value="">— select destination —</option>${accOptionsTo}
+        </select>
+      </div>
+
+      <div class="form-group" id="tx-category-group">
         <label class="form-label">Category</label>
         <select class="form-select" id="tx-category">
           ${catOpts(expCats, 'c-mx')}
@@ -2139,8 +2151,15 @@ Screens.tx = {
     document.querySelectorAll('#tx-type-seg .seg-btn').forEach(b => b.classList.remove('active'));
     el.classList.add('active');
     document.getElementById('tx-type-val').value = type;
+    const isTransfer = type === 'transfer';
+    const toAccGrp   = document.getElementById('tx-to-account-group');
+    const catGrp     = document.getElementById('tx-category-group');
+    const accLabel   = document.getElementById('tx-account-label');
+    if (toAccGrp)  toAccGrp.style.display  = isTransfer ? '' : 'none';
+    if (catGrp)    catGrp.style.display    = isTransfer ? 'none' : '';
+    if (accLabel)  accLabel.textContent    = isTransfer ? 'From Account' : 'Account';
     const catSel = document.getElementById('tx-category');
-    if (catSel && this._catOpts) catSel.innerHTML = this._catOpts[type];
+    if (catSel && this._catOpts && !isTransfer) catSel.innerHTML = this._catOpts[type] || this._catOpts.expense;
   },
 
   async saveNew() {
@@ -2148,7 +2167,6 @@ Screens.tx = {
     const desc    = (document.getElementById('tx-desc').value || '').trim();
     const date    = document.getElementById('tx-date').value;
     const accId   = document.getElementById('tx-account').value;
-    const catId   = document.getElementById('tx-category').value;
     const type    = document.getElementById('tx-type-val').value;
     const notes   = (document.getElementById('tx-notes').value || '').trim();
 
@@ -2157,25 +2175,44 @@ Screens.tx = {
     if (!date)                  return UI.toast('Select a date', 'error');
     if (!accId)                 return UI.toast('Select an account', 'error');
 
-    /*
-     * PHASE_2_HOOK: run description through MerchantEngine.resolve() here.
-     * If a match is found, override catId and merchant name.
-     *
-     *   const resolved = MerchantEngine.resolve(desc);
-     *   if (resolved) {
-     *     merchant = resolved.merchant;
-     *     catId    = CATS.idFromName(resolved.category) || catId;
-     *   }
-     */
+    // ── Transfer: two linked transactions ──────────────────
+    if (type === 'transfer') {
+      const toAccId = (document.getElementById('tx-to-account') || {}).value;
+      if (!toAccId)         return UI.toast('Select a destination account', 'error');
+      if (toAccId === accId) return UI.toast('Source and destination must differ', 'error');
+      const groupId = Utils.uid();
+      const base = { date, description: desc, merchant: desc, categoryId: 'c-py',
+                     amount, notes, status: 'reviewed', source: 'manual',
+                     hash: Utils.txHash(date, amount, desc), transferGroupId: groupId };
+      const txOut = { ...base, id: Utils.uid(), accountId: accId,   type: 'transfer' };
+      const txIn  = { ...base, id: Utils.uid(), accountId: toAccId, type: 'transfer',
+                      hash: Utils.txHash(date, amount, desc + '_in') };
+      await DB.put('transactions', txOut);
+      await DB.put('transactions', txIn);
+      const accFrom = State.accountById(accId);
+      const accTo   = State.accountById(toAccId);
+      if (accFrom) { accFrom.balance = (accFrom.balance || 0) - amount; await DB.put('accounts', accFrom); }
+      if (accTo)   { accTo.balance   = (accTo.balance   || 0) + amount; await DB.put('accounts', accTo);   }
+      State.transactions.push(txOut, txIn);
+      [accId, toAccId].forEach(aid => {
+        const i = State.accounts.findIndex(a => a.id === aid);
+        if (i >= 0) State.accounts[i] = State.accountById(aid);
+      });
+      UI.closeModal('tx');
+      UI.toast('Transfer recorded', 'success');
+      App.rerender();
+      return;
+    }
+
+    let catId   = document.getElementById('tx-category').value;
+
     // Phase 2: MerchantEngine resolution
     let merchant  = desc;
-    let resolvedCat = null;
-    {
-      const r = MerchantEngine.resolve(desc);
-      if (r) { merchant = r.merchant; resolvedCat = CATS.idFromName(r.category); }
-    }
-    if (resolvedCat && !document.getElementById('tx-category').dataset.userEdited) {
-      catId = resolvedCat;
+    const r = MerchantEngine.resolve(desc);
+    if (r) {
+      merchant = r.merchant;
+      const resolved = CATS.idFromName(r.category);
+      if (resolved && !document.getElementById('tx-category').dataset.userEdited) catId = resolved;
     }
 
     const tx = {
@@ -2188,10 +2225,9 @@ Screens.tx = {
       type,
       amount,
       notes,
-      // Phase 2 fields (pre-populated for schema consistency):
-      status:      'reviewed',  // Phase 2: 'unreviewed' when auto-imported
-      source:      'manual',    // Phase 2: bank name when imported
-      hash:        Utils.txHash(date, amount, desc),  // Phase 2: dedup key
+      status:      'reviewed',
+      source:      'manual',
+      hash:        Utils.txHash(date, amount, desc),
     };
 
     await DB.put('transactions', tx);
@@ -2231,10 +2267,21 @@ Screens.tx = {
 
     const typeColors = { expense: 'var(--rd)', income: 'var(--gn)', investment: 'var(--bl)' };
 
+    // Find transfer counterpart account name if applicable
+    const isTransfer = tx.type === 'transfer';
+    let transferPartnerName = null;
+    if (isTransfer && tx.transferGroupId) {
+      const partner = State.transactions.find(t => t.transferGroupId === tx.transferGroupId && t.id !== tx.id);
+      if (partner) {
+        const partnerAcc = State.accountById(partner.accountId);
+        transferPartnerName = partnerAcc ? partnerAcc.name : null;
+      }
+    }
+
     document.getElementById('modal-txd-body').innerHTML = `
       <!-- Amount hero -->
       <div style="text-align:center;padding:16px 0 22px">
-        <div style="font-size:44px;margin-bottom:6px">${cat.icon}</div>
+        <div style="font-size:44px;margin-bottom:6px">${isTransfer ? '⇄' : cat.icon}</div>
         <div style="font-size:30px;font-weight:900;letter-spacing:-1px" class="${col}">
           ${sign}${Utils.fmtAmt(tx.amount, { full: true })}
         </div>
@@ -2243,10 +2290,13 @@ Screens.tx = {
         <div style="font-size:12px;color:var(--tx2);margin-top:6px">
           ${Utils.fmtDate(tx.date)}
           ${acc ? ` &nbsp;·&nbsp; ${escHtml(acc.name)}` : ''}
+          ${transferPartnerName ? ` &nbsp;→&nbsp; ${escHtml(transferPartnerName)}` : ''}
         </div>
+        ${isTransfer ? `<div style="margin-top:8px;display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;background:var(--tx2)22;color:var(--tx2)">TRANSFER</div>` : ''}
       </div>
 
-      <!-- Type toggle -->
+      <!-- Type toggle (hidden for transfers) -->
+      ${isTransfer ? '' : `
       <div class="form-group">
         <label class="form-label">Type</label>
         <div class="segmented" id="dtl-type-seg">
@@ -2255,7 +2305,7 @@ Screens.tx = {
                  onclick="Screens.tx._detailType('${txId}','${t}',this)">${t.charAt(0).toUpperCase()+t.slice(1)}</div>
           `).join('')}
         </div>
-      </div>
+      </div>`}
 
       <!-- Category -->
       <div class="form-group">
@@ -2739,12 +2789,6 @@ Screens.settings = {
     if (!confirm('Delete this merchant rule?')) return;
     await DB.remove('mappings', id);
     State.mappings = State.mappings.filter(m => m.id !== id);
-    let addedBudgets = 0;
-    for (const b of (data.budgets || [])) {
-      await DB.put('budgets', b);
-      addedBudgets++;
-    }
-    if (addedBudgets > 0) await Screens.reports.init();
     MerchantEngine.loadUserMappings(State.mappings);
     UI.toast('Rule deleted', 'info');
     App.rerender();
@@ -3277,6 +3321,9 @@ const BankParser = (() => {
     // Scapia / single-amount credit card
     if (H.includes('DATE') && H.includes('DESCRIPTION') && H.includes('AMOUNT') && !H.includes('WITHDRAWAL'))
       return { bank: 'Scapia', stmtType: 'credit', parseFn: parseScapia };
+    // Splitwise expense export
+    if (H.includes('CATEGORY') && H.includes('COST') && H.includes('CURRENCY') && H.includes('DATE'))
+      return { bank: 'Splitwise', stmtType: 'shared', parseFn: parseSplitwise };
     return { bank: 'Unknown', stmtType: 'savings', parseFn: parseGeneric };
   }
 
@@ -3389,6 +3436,73 @@ const BankParser = (() => {
         type = 'income';
       }
       out.push({ date, description: (r[iN]||'').trim(), amount: Math.abs(a), type });
+    }
+    return out;
+  }
+
+  // ─── Splitwise CSV Export ────────────────────────────────
+  // Date | Description | Category | Cost | Currency | [Member1] | [Member2] | ...
+  // Positive member value = they are owed (they paid); negative = they owe others.
+  // We import only rows where the user owes money (net debit), treating the full
+  // Cost as the expense if no member column can be identified as "you".
+  const _SPLITWISE_CAT_MAP = {
+    'food and drink':  'c-do',  'food':          'c-fd',
+    'groceries':       'c-gr',  'dining out':    'c-do',
+    'restaurant':      'c-do',  'coffee':        'c-cf',
+    'transportation':  'c-tr',  'transport':     'c-tr',
+    'taxi':            'c-tr',  'cab':           'c-tr',
+    'travel':          'c-tv',  'flights':       'c-tv',
+    'hotel':           'c-tv',  'accommodation': 'c-tv',
+    'entertainment':   'c-en',  'movies':        'c-en',
+    'sports':          'c-sf',  'fitness':       'c-sf',
+    'utilities':       'c-ut',  'electricity':   'c-ut',
+    'bills':           'c-ut',  'phone':         'c-ut',
+    'shopping':        'c-sh',  'clothing':      'c-sh',
+    'health':          'c-hc',  'medical':       'c-hc',
+    'education':       'c-ed',  'rent':          'c-ho',
+    'housing':         'c-ho',  'home':          'c-ho',
+    'insurance':       'c-is',  'general':       'c-mx',
+    'other':           'c-mx',  'miscellaneous': 'c-mx',
+  };
+  function _swCategory(raw) {
+    if (!raw) return 'c-mx';
+    const k = raw.trim().toLowerCase();
+    for (const [pat, id] of Object.entries(_SPLITWISE_CAT_MAP)) {
+      if (k.includes(pat)) return id;
+    }
+    return 'c-mx';
+  }
+  function parseSplitwise(rows, hdrs) {
+    const iD    = fi(hdrs, ['DATE']);
+    const iDesc = fi(hdrs, ['DESCRIPTION', 'TITLE', 'NAME']);
+    const iCat  = fi(hdrs, ['CATEGORY']);
+    const iCost = fi(hdrs, ['COST', 'AMOUNT']);
+    const iCurr = fi(hdrs, ['CURRENCY']);
+    // Member columns: everything after Currency (or Cost if no Currency)
+    const memberStartIdx = (iCurr >= 0 ? iCurr : iCost) + 1;
+    const memberCols = hdrs.slice(memberStartIdx).map((h, i) => ({ name: h.trim(), idx: memberStartIdx + i }));
+    const out = [];
+    for (const r of rows) {
+      const date  = pd(r[iD]);  if (!date) continue;
+      const desc  = (iDesc >= 0 ? r[iDesc] : r[1] || '').trim();  if (!desc) continue;
+      const cost  = pa(r[iCost]);  if (!cost || cost <= 0) continue;
+      const catId = _swCategory(iCat >= 0 ? r[iCat] : '');
+      // Try to find user's share: look for a member column with a negative value
+      // (negative = they owe; positive = they are owed by others)
+      let userShare = null;
+      for (const mc of memberCols) {
+        const v = pa(r[mc.idx]);
+        if (v != null && v < 0) { userShare = Math.abs(v); break; }
+      }
+      // If no negative column found, check if there's only one member column → that's the user
+      if (userShare === null && memberCols.length === 1) {
+        const v = pa(r[memberCols[0].idx]);
+        if (v != null) userShare = Math.abs(v);
+      }
+      // Fallback: use total cost (user is importing their full share)
+      const amount = userShare !== null ? userShare : cost;
+      if (amount <= 0) continue;
+      out.push({ date, description: desc, amount, type: 'expense', _splitwiseCatId: catId });
     }
     return out;
   }
@@ -3533,8 +3647,8 @@ const PDFParser = (() => {
     let m;
     m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
     if (m) { const y = m[3].length === 2 ? '20'+m[3] : m[3]; return `${y}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`; }
-    m = s.match(/^(\d{1,2})[\s\-]([A-Za-z]{3})[\s\-](\d{4})$/);
-    if (m) { const mo = MO[m[2].toLowerCase()]; if (mo) return `${m[3]}-${mo}-${m[1].padStart(2,'0')}`; }
+    m = s.match(/^(\d{1,2})[\s\-]([A-Za-z]{3})[\s\-](\d{2,4})$/);
+    if (m) { const mo = MO[m[2].toLowerCase()]; if (mo) { const y = m[3].length === 2 ? '20'+m[3] : m[3]; return `${y}-${mo}-${m[1].padStart(2,'0')}`; } }
     m = s.match(/^([A-Za-z]{3})\s+(\d{1,2})[,\s]+(\d{4})$/);
     if (m) { const mo = MO[m[1].toLowerCase()]; if (mo) return `${m[3]}-${mo}-${m[2].padStart(2,'0')}`; }
     return null;
@@ -3542,34 +3656,14 @@ const PDFParser = (() => {
 
   function _pa(s) {
     if (!s) return null;
-    const v = parseFloat(String(s).replace(/[₹,\s]/g, ''));
-    return isNaN(v) ? null : v;
+    // Strip currency symbol, commas, whitespace, and parentheses (some banks use "(1,234.56)" for debits)
+    const v = parseFloat(String(s).replace(/[₹,()\s]/g, ''));
+    return isNaN(v) ? null : Math.abs(v);
   }
 
   // ─── Column helpers ────────────────────────────────────
-  // Find the first row index whose text contains ≥ minMatch of the given keywords
-  function _findHdrIdx(rows, keywords, minMatch) {
-    const KW = keywords.map(k => k.toUpperCase());
-    minMatch = minMatch || KW.length;
-    for (let i = 0; i < Math.min(rows.length, 80); i++) {
-      const u = rows[i].text.toUpperCase();
-      if (KW.filter(k => u.includes(k)).length >= minMatch) return i;
-    }
-    return -1;
-  }
-
-  // Build column descriptors from a header row's items
-  function _colRanges(hdrRow) {
-    const its = hdrRow.items;
-    return its.map((it, i) => ({
-      name:    it.str.toUpperCase().trim(),
-      xCenter: it.x + it.w / 2,
-      xMin:    i === 0 ? -Infinity : (its[i-1].x + its[i-1].w + it.x) / 2,
-      xMax:    i === its.length-1 ? Infinity : (it.x + it.w + its[i+1].x) / 2,
-    }));
-  }
-
-  // Assign each item in a data row to the nearest column
+  // ─── Column helpers ────────────────────────────────────
+  // Assign each item in a data row to the nearest column by x-center distance
   function _assign(cols, dataRow) {
     const r = {};
     for (const c of cols) r[c.name] = '';
@@ -3581,219 +3675,145 @@ const PDFParser = (() => {
     return r;
   }
 
-  // Return value of first column whose name includes any of the given keywords
-  function _cv(d, ...keys) {
-    const found = Object.keys(d).find(k => keys.some(kw => k.toUpperCase().includes(kw.toUpperCase())));
-    return found ? d[found] : '';
+  const DATE_LINE_RE = /\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b|\b\d{1,2}[\s\-][A-Za-z]{3}[\s\-]\d{2,4}\b/;
+
+  // ─── Generic table engine ──────────────────────────────
+  // drcr listed first so "DR/CR" columns don't accidentally match as debit or credit
+  const _COL_TYPES = [
+    { type: 'drcr',        re: /dr\s*\/\s*cr|cr\s*\/\s*dr/i },
+    { type: 'date',        re: /\bdate\b|\bdt\b/i },
+    { type: 'description', re: /\b(?:description|narration|particular|detail|merchant|remark|payee|beneficiar)/i },
+    { type: 'debit',       re: /\b(?:debit|withdrawal|dr)\b/i },
+    { type: 'credit',      re: /\b(?:credit|deposit|cr)\b/i },
+    { type: 'amount',      re: /\b(?:amount|amt)\b/i },
+    { type: 'balance',     re: /\b(?:balance|bal)\b/i },
+  ];
+  const _COL_IGNORE_RE = /\b(?:cheque|chq|reward|points?|pts|ifsc|utr|sr\.?\s*no|s\.?\s*no|sl\.?\s*no|ref\.?\s*no)\b/i;
+
+  function _classifyColType(name) {
+    if (_COL_IGNORE_RE.test(name)) return 'ignore';
+    for (const { type, re } of _COL_TYPES) { if (re.test(name)) return type; }
+    return 'unknown';
   }
 
-  const DATE_LINE_RE = /\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b|\b\d{1,2}\s[A-Za-z]{3}\s\d{4}\b/;
+  function _headerScore(row) {
+    const USEFUL = new Set(['date','description','debit','credit','amount']);
+    let score = 0;
+    for (const it of row.items) {
+      const t = _classifyColType(it.str);
+      if (USEFUL.has(t)) score += 2;
+      else if (t !== 'unknown') score += 1;
+    }
+    return score;
+  }
 
-  // ─── Bank detection ────────────────────────────────────
+  // Build typed column descriptors. If no explicit description column exists,
+  // promote the widest unknown column (description columns are typically the widest).
+  function _buildTypedCols(hdrRow) {
+    const its = hdrRow.items;
+    const cols = its.map((it, i) => ({
+      name:    it.str.toUpperCase().trim(),
+      type:    _classifyColType(it.str),
+      xCenter: it.x + it.w / 2,
+      xMin:    i === 0 ? -Infinity : (its[i-1].x + its[i-1].w + it.x) / 2,
+      xMax:    i === its.length-1 ? Infinity : (it.x + it.w + its[i+1].x) / 2,
+    }));
+    if (!cols.some(c => c.type === 'description')) {
+      const unknowns = cols.filter(c => c.type === 'unknown');
+      if (unknowns.length)
+        unknowns.reduce((a, b) => (b.xMax - b.xMin) > (a.xMax - a.xMin) ? b : a).type = 'description';
+    }
+    return cols;
+  }
+
+  // Find and parse every transaction table in the document.
+  // Handles multi-section statements (e.g. domestic + international CC tables).
+  function _parseTable(rows) {
+    const THRESHOLD = 4;
+    const headerIdxs = [];
+    for (let i = 0; i < rows.length; i++) {
+      const s = _headerScore(rows[i]);
+      // New header only if above threshold AND at least 10 rows after the previous one
+      if (s >= THRESHOLD && (!headerIdxs.length || i - headerIdxs[headerIdxs.length-1] > 10))
+        headerIdxs.push(i);
+    }
+    if (!headerIdxs.length) return _genericPDF(rows);
+
+    const all = [];
+    for (let h = 0; h < headerIdxs.length; h++) {
+      const hi     = headerIdxs[h];
+      const nextHi = h + 1 < headerIdxs.length ? headerIdxs[h+1] : rows.length;
+      const cols   = _buildTypedCols(rows[hi]);
+
+      const amtCols   = cols.filter(c => c.type === 'amount');
+      const debitCols = cols.filter(c => c.type === 'debit');
+      const crCols    = cols.filter(c => c.type === 'credit');
+      if (!amtCols.length && !debitCols.length && !crCols.length) continue;
+
+      const dateCols = cols.filter(c => c.type === 'date');
+      const descCols = cols.filter(c => c.type === 'description');
+      const drcrCols = cols.filter(c => c.type === 'drcr');
+
+      for (let i = hi + 1; i < nextHi; i++) {
+        const row = rows[i];
+        if (!DATE_LINE_RE.test(row.text)) continue;
+        const d = _assign(cols, row);
+
+        // Date: try each classified date column, fall back to scanning the row text
+        let date = null;
+        for (const c of dateCols) { date = _pd(d[c.name]); if (date) break; }
+        if (!date) { const m = row.text.match(DATE_LINE_RE); date = m ? _pd(m[0]) : null; }
+        if (!date) continue;
+
+        // Description: join classified columns, or strip dates/amounts from the row text
+        const desc = descCols.map(c => d[c.name]).filter(Boolean).join(' ').trim()
+          || row.text.replace(DATE_LINE_RE, '').replace(/[\d,]+\.\d{2}/g, '')
+                     .replace(/\bDr\b|\bCr\b/gi, '').replace(/\s+/g, ' ').trim();
+
+        if (amtCols.length) {
+          // Single amount column: Dr/Cr suffix or explicit Dr/Cr column signals direction
+          const amtStr = amtCols.map(c => d[c.name]).find(v => v) || '';
+          const amt    = _pa(amtStr.replace(/[Cc][Rr]|[Dd][Rr]/g, ''));
+          if (!amt) continue;
+          const drCrVal = drcrCols.map(c => d[c.name]).join(' ');
+          const isCr = /\bCr\b/i.test(amtStr) || /\bCr\b/i.test(drCrVal)
+            || /CREDIT|REFUND|REVERSAL|CASHBACK/i.test(row.text);
+          all.push({ date, description: desc, amount: amt, type: isCr ? 'income' : 'expense' });
+        } else {
+          // Separate debit / credit columns
+          const dr = debitCols.reduce((a, c) => a || _pa(d[c.name]), null);
+          const cr = crCols.reduce((a, c) => a || _pa(d[c.name]), null);
+          if (dr && dr > 0) all.push({ date, description: desc, amount: dr, type: 'expense' });
+          if (cr && cr > 0) all.push({ date, description: desc, amount: cr, type: 'income' });
+        }
+      }
+    }
+    return all.length ? all : _genericPDF(rows);
+  }
+
+  // ─── Bank + statement-type detection ───────────────────
+  // Only identifies bank name and savings/credit type for display.
+  // All transaction extraction is handled by _parseTable above.
   function _detect(rows) {
     const head = rows.slice(0, 50).map(r => r.text).join(' ').toLowerCase();
-    if (head.includes('hdfc bank') || head.includes('hdfcbank')) {
-      if (head.includes('credit card') || head.includes('statement of credit'))
-        return { bank:'HDFC Bank', stmtType:'credit', fn:_hdfcCredit };
-      return { bank:'HDFC Bank', stmtType:'savings', fn:_hdfcSavings };
-    }
-    if (head.includes('icici bank')) {
-      if (head.includes('credit card'))
-        return { bank:'ICICI Bank', stmtType:'credit', fn:_iciciCredit };
-      return { bank:'ICICI Bank', stmtType:'savings', fn:_iciciSavings };
-    }
-    if (head.includes('axis bank')) {
-      if (head.includes('credit card'))
-        return { bank:'Axis Bank', stmtType:'credit', fn:_axisCredit };
-      return { bank:'Axis Bank', stmtType:'savings', fn:_axisSavings };
-    }
+    if (head.includes('hdfc bank') || head.includes('hdfcbank'))
+      return { bank:'HDFC Bank', stmtType: (head.includes('credit card') || head.includes('statement of credit')) ? 'credit' : 'savings' };
+    if (head.includes('icici bank'))
+      return { bank:'ICICI Bank', stmtType: head.includes('credit card') ? 'credit' : 'savings' };
+    if (head.includes('axis bank'))
+      return { bank:'Axis Bank', stmtType: head.includes('credit card') ? 'credit' : 'savings' };
     if (head.includes('state bank of india') || (head.includes('state bank') && head.includes('sbi')))
-      return { bank:'SBI', stmtType:'savings', fn:_sbi };
+      return { bank:'SBI', stmtType:'savings' };
     if (head.includes('scapia') || (head.includes('federal bank') && head.includes('credit card')))
-      return { bank:'Scapia', stmtType:'credit', fn:_scapia };
-    return { bank:'Unknown', stmtType:'savings', fn:_genericPDF };
-  }
-
-  // ─── HDFC Savings PDF ──────────────────────────────────
-  // Date | Narration | Chq/Ref | Value Dt | Withdrawal Amt | Deposit Amt | Balance
-  function _hdfcSavings(rows) {
-    const hi = _findHdrIdx(rows, ['NARRATION','WITHDRAWAL','DEPOSIT'], 2);
-    if (hi < 0) return _genericPDF(rows);
-    const cols = _colRanges(rows[hi]);
-    const txns = [];
-    for (let i = hi+1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!DATE_LINE_RE.test(row.text)) continue;
-      const d    = _assign(cols, row);
-      const date = _pd(_cv(d,'DATE'));
-      if (!date) continue;
-      const desc = _cv(d,'NARRATION','DESCRIPTION');
-      const dr   = _pa(_cv(d,'WITHDRAWAL','DR'));
-      const cr   = _pa(_cv(d,'DEPOSIT','CR'));
-      if (dr && dr > 0) txns.push({ date, description: desc, amount: dr, type:'expense' });
-      if (cr && cr > 0) txns.push({ date, description: desc, amount: cr, type:'income' });
+      return { bank:'Scapia', stmtType:'credit' };
+    // Unknown bank: infer savings vs credit from the first table header found
+    for (let i = 0; i < rows.length; i++) {
+      if (_headerScore(rows[i]) >= 4) {
+        const cols = _buildTypedCols(rows[i]);
+        return { bank:'Unknown', stmtType: (cols.some(c => c.type === 'debit') && cols.some(c => c.type === 'credit')) ? 'savings' : 'credit' };
+      }
     }
-    return txns;
-  }
-
-  // ─── HDFC Credit Card PDF ──────────────────────────────
-  // Date | Transaction Description | Reward Pts | Intl Amt | Amount(INR)  [Cr suffix = refund]
-  function _hdfcCredit(rows) {
-    const hi = _findHdrIdx(rows, ['DATE','AMOUNT'], 2);
-    if (hi < 0) return _genericPDF(rows);
-    const cols = _colRanges(rows[hi]);
-    const txns = [];
-    for (let i = hi+1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!DATE_LINE_RE.test(row.text)) continue;
-      const d      = _assign(cols, row);
-      const date   = _pd(_cv(d,'DATE'));
-      if (!date) continue;
-      const amtStr = _cv(d,'AMOUNT');
-      const amt    = _pa(amtStr.replace(/[Cc][Rr]|[Dd][Rr]/g,''));
-      if (!amt) continue;
-      const desc   = _cv(d,'DESCRIPTION','DETAILS','NARRATION','PARTICULAR');
-      const isCr   = /\bCr\b/i.test(amtStr) || /CREDIT|REFUND|REVERSAL|CASHBACK/i.test(row.text);
-      txns.push({ date, description: desc, amount: Math.abs(amt), type: isCr ? 'income' : 'expense' });
-    }
-    return txns;
-  }
-
-  // ─── ICICI Savings PDF ─────────────────────────────────
-  // S No | Value Date | Transaction Date | Cheque No | Remarks | Withdrawal | Deposit | Balance
-  function _iciciSavings(rows) {
-    const hi = _findHdrIdx(rows, ['WITHDRAWAL','DEPOSIT'], 2);
-    if (hi < 0) return _genericPDF(rows);
-    const cols = _colRanges(rows[hi]);
-    const txns = [];
-    for (let i = hi+1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!DATE_LINE_RE.test(row.text)) continue;
-      const d       = _assign(cols, row);
-      const dateStr = _cv(d,'TRANSACTION DATE','DATE');
-      const date    = _pd(dateStr) || (() => { const m = row.text.match(DATE_LINE_RE); return m ? _pd(m[0]) : null; })();
-      if (!date) continue;
-      const desc = _cv(d,'REMARKS','NARRATION','DESCRIPTION');
-      const dr   = _pa(_cv(d,'WITHDRAWAL'));
-      const cr   = _pa(_cv(d,'DEPOSIT'));
-      if (dr && dr > 0) txns.push({ date, description: desc, amount: dr, type:'expense' });
-      if (cr && cr > 0) txns.push({ date, description: desc, amount: cr, type:'income' });
-    }
-    return txns;
-  }
-
-  // ─── ICICI Credit Card PDF ─────────────────────────────
-  // Date | Transaction Description | Amount (INR)  [Dr/Cr suffix]
-  function _iciciCredit(rows) {
-    const hi = _findHdrIdx(rows, ['DATE','DESCRIPTION','AMOUNT'], 2);
-    if (hi < 0) return _genericPDF(rows);
-    const cols = _colRanges(rows[hi]);
-    const txns = [];
-    for (let i = hi+1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!DATE_LINE_RE.test(row.text)) continue;
-      const d      = _assign(cols, row);
-      const date   = _pd(_cv(d,'DATE'));
-      if (!date) continue;
-      const amtStr = _cv(d,'AMOUNT');
-      const amt    = _pa(amtStr.replace(/[Cc][Rr]|[Dd][Rr]/g,''));
-      if (!amt) continue;
-      const desc   = _cv(d,'DESCRIPTION','NARRATION','PARTICULAR');
-      const isCr   = /\bCr\b/i.test(amtStr) || /CREDIT|REFUND|REVERSAL|CASHBACK/i.test(row.text);
-      txns.push({ date, description: desc, amount: Math.abs(amt), type: isCr ? 'income' : 'expense' });
-    }
-    return txns;
-  }
-
-  // ─── Axis Savings PDF ──────────────────────────────────
-  // Tran Date | Chq No | PARTICULARS | DR | CR | Balance
-  function _axisSavings(rows) {
-    const hi = _findHdrIdx(rows, ['PARTICULARS','DR'], 2);
-    if (hi < 0) return _genericPDF(rows);
-    const cols = _colRanges(rows[hi]);
-    const txns = [];
-    for (let i = hi+1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!DATE_LINE_RE.test(row.text)) continue;
-      const d    = _assign(cols, row);
-      const date = _pd(_cv(d,'DATE'));
-      if (!date) continue;
-      const desc = _cv(d,'PARTICULAR','NARRATION');
-      const dr   = _pa(_cv(d,'DR','DEBIT','WITHDRAWAL'));
-      const cr   = _pa(_cv(d,'CR','CREDIT','DEPOSIT'));
-      if (dr && dr > 0) txns.push({ date, description: desc, amount: dr, type:'expense' });
-      if (cr && cr > 0) txns.push({ date, description: desc, amount: cr, type:'income' });
-    }
-    return txns;
-  }
-
-  // ─── Axis Credit Card PDF ──────────────────────────────
-  // Transaction Date | Transaction Details | Amount (INR)  [Dr/Cr]
-  function _axisCredit(rows) {
-    const hi = _findHdrIdx(rows, ['DATE','AMOUNT'], 2);
-    if (hi < 0) return _genericPDF(rows);
-    const cols = _colRanges(rows[hi]);
-    const txns = [];
-    for (let i = hi+1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!DATE_LINE_RE.test(row.text)) continue;
-      const d      = _assign(cols, row);
-      const date   = _pd(_cv(d,'DATE'));
-      if (!date) continue;
-      const amtStr = _cv(d,'AMOUNT');
-      const amt    = _pa(amtStr.replace(/[Cc][Rr]|[Dd][Rr]/g,''));
-      if (!amt) continue;
-      const desc   = _cv(d,'DETAIL','DESCRIPTION','PARTICULAR','NARRATION');
-      const isCr   = /\bCr\b/i.test(amtStr) || /CREDIT|REFUND|REVERSAL|CASHBACK/i.test(row.text);
-      txns.push({ date, description: desc, amount: Math.abs(amt), type: isCr ? 'income' : 'expense' });
-    }
-    return txns;
-  }
-
-  // ─── SBI Savings PDF ───────────────────────────────────
-  // Txn Date | Value Date | Description | Ref No | Debit | Credit | Balance
-  function _sbi(rows) {
-    const hi = _findHdrIdx(rows, ['DESCRIPTION','DEBIT','CREDIT'], 2);
-    if (hi < 0) return _genericPDF(rows);
-    const cols = _colRanges(rows[hi]);
-    const txns = [];
-    for (let i = hi+1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!DATE_LINE_RE.test(row.text)) continue;
-      const d       = _assign(cols, row);
-      const dateStr = _cv(d,'TXN DATE','TRANSACTION DATE','DATE');
-      const date    = _pd(dateStr) || (() => { const m = row.text.match(DATE_LINE_RE); return m ? _pd(m[0]) : null; })();
-      if (!date) continue;
-      const desc = _cv(d,'DESCRIPTION','NARRATION','PARTICULAR');
-      const dr   = _pa(_cv(d,'DEBIT'));
-      const cr   = _pa(_cv(d,'CREDIT'));
-      if (dr && dr > 0) txns.push({ date, description: desc, amount: dr, type:'expense' });
-      if (cr && cr > 0) txns.push({ date, description: desc, amount: cr, type:'income' });
-    }
-    return txns;
-  }
-
-  // ─── Scapia Credit Card PDF ────────────────────────────
-  function _scapia(rows) {
-    const hi = _findHdrIdx(rows, ['DATE','AMOUNT'], 2);
-    if (hi < 0) return _genericPDF(rows);
-    const cols = _colRanges(rows[hi]);
-    const txns = [];
-    for (let i = hi+1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!DATE_LINE_RE.test(row.text)) continue;
-      const d       = _assign(cols, row);
-      const date    = _pd(_cv(d,'DATE'));
-      if (!date) continue;
-      const amtStr  = _cv(d,'AMOUNT');
-      const amt     = _pa(amtStr.replace(/[Cc][Rr]|[Dd][Rr]/g,''));
-      if (!amt) continue;
-      const desc    = _cv(d,'DESCRIPTION','MERCHANT','DETAIL','NARRATION');
-      const typeStr = _cv(d,'TYPE','DR','CR');
-      const isCr    = /\bCr\b/i.test(amtStr) || /CR|CREDIT|REFUND/i.test(typeStr) || /REVERSAL|CASHBACK/i.test(row.text);
-      txns.push({ date, description: desc, amount: Math.abs(amt), type: isCr ? 'income' : 'expense' });
-    }
-    return txns;
+    return { bank:'Unknown', stmtType:'savings' };
   }
 
   // ─── Generic PDF fallback ──────────────────────────────
@@ -3830,7 +3850,7 @@ const PDFParser = (() => {
     if (!rows.length) return { error: 'PDF has no extractable text. Scanned/image PDFs are not supported — please use a digital statement PDF.', txns: [] };
 
     const det  = _detect(rows);
-    const txns = det.fn(rows).filter(t => t.date && t.amount > 0 && t.description.trim().length > 0);
+    const txns = _parseTable(rows).filter(t => t.date && t.amount > 0 && t.description.trim().length > 0);
     return { bank: det.bank, stmtType: det.stmtType, txns, total: txns.length };
   }
 
@@ -3863,7 +3883,7 @@ Screens.import = {
            ondrop="this.classList.remove('drag-over');Screens.import.handleDrop(event)">
         <div class="upload-zone-icon">📄</div>
         <div class="upload-zone-title">Tap to upload bank statement</div>
-        <div class="upload-zone-sub">HDFC · ICICI · Axis · SBI · Scapia</div>
+        <div class="upload-zone-sub">HDFC · ICICI · Axis · SBI · Scapia · Splitwise</div>
         <div class="upload-zone-sub" style="margin-top:4px;font-size:11px;color:var(--tx3)">
           PDF &amp; CSV supported · Auto-detects bank · Duplicates skipped
         </div>
@@ -3880,6 +3900,7 @@ Screens.import = {
           ['Axis Bank',  'Savings · Credit Card', '#97144d'],
           ['SBI',        'Savings Account',       '#22409a'],
           ['Scapia',     'Credit Card',           '#ff6b6b'],
+          ['Splitwise',  'Shared Expenses CSV',   '#5bc5a7'],
         ].map(([bank, types, dot]) => `
           <div class="bank-row">
             <div class="bank-dot" style="background:${dot}"></div>
@@ -3945,12 +3966,15 @@ Screens.import = {
       // Run every transaction through MerchantEngine
       const enriched = result.txns.map(t => {
         const r = MerchantEngine.resolve(t.description);
+        // For Splitwise rows, honour the category mapped from their category column
+        const swCat = t._splitwiseCatId ? CATS.get(t._splitwiseCatId) : null;
+        const catName = r ? r.category : (swCat ? swCat.name : null);
         return {
           ...t,
           merchant:   r ? r.merchant  : null,
-          icon:       r ? r.icon      : '❓',
-          catName:    r ? r.category  : null,
-          resolved:   !!r,
+          icon:       r ? r.icon      : (swCat ? swCat.icon : '❓'),
+          catName,
+          resolved:   !!(r || swCat),
           hash:       Utils.txHash(t.date, t.amount, t.description),
         };
       });
@@ -5009,6 +5033,9 @@ Screens.reports = {
 
   async setBudget(catId, name, icon, color, rawVal) {
     const limit = parseFloat(rawVal);
+    if (rawVal !== '' && rawVal !== null && rawVal !== undefined && !(limit > 0)) {
+      UI.toast('Budget must be a positive amount', 'error'); return;
+    }
     this._budgets = this._budgets.filter(b => b.id !== catId);
     if (limit > 0) {
       const entry = { id: catId, limit, name, icon, color };
@@ -5843,3 +5870,4 @@ if ('serviceWorker' in navigator) {
 
 </body>
 </html>
+

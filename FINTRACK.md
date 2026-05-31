@@ -588,3 +588,140 @@ PDF.js (`pdf.min.js` + `pdf.worker.min.js`) is loaded from the cdnjs CDN. The Se
 - Both files are in the browser cache
 - PDF parsing works fully offline
 - If the cache is cleared, PDF parsing requires one internet request to re-fetch PDF.js
+
+---
+
+## Changelog
+
+### v4.1 (current)
+- **Fix** `deleteMapping()` crash — dead `data.budgets` reference removed
+- **Fix** `catId` const-reassignment bug in `saveNew()` — changed to `let`
+- **Feature** Account transfers — new "Transfer" type in Add Transaction modal; creates linked debit/credit pair, adjusts both account balances, excluded from expense/income totals
+- **Feature** Splitwise CSV import — auto-detects Splitwise export format, maps Splitwise categories to Fintrack categories, imports your share per row (negative member column = your owe amount)
+- **UI** Transfer transactions show `⇄` sign instead of `−` in transaction rows
+
+---
+
+## Roadmap
+
+Priority tiers: **P0** = high-value, low-effort · **P1** = high-value, medium-effort · **P2** = significant effort or niche
+
+---
+
+### Phase 5 — Splitwise Deep Integration (P0)
+
+The current Splitwise import handles the basic case. These improvements make it complete.
+
+| Feature | Detail |
+|---------|--------|
+| **Column picker UI** | When Splitwise format is detected, show a step asking the user to pick which column header represents their name. Stores the selection for future imports. |
+| **Settlement import** | Detect "payment" rows in Splitwise CSV (zero cost, one member positive, one negative) and import as income/transfer. |
+| **Split tracking** | Mark imported Splitwise transactions with a "split" badge. Show a "Friends owe you" summary on the Dashboard. |
+| **Reimbursement matching** | When a UPI credit arrives that matches a pending Splitwise owed amount, auto-suggest linking them. |
+
+---
+
+### Phase 6 — Smart Automation (P0)
+
+Make the app work for you between imports.
+
+| Feature | Detail |
+|---------|--------|
+| **Quick-add shortcuts** | Pin up to 5 frequent transactions on Dashboard (e.g. "Monthly rent ₹25,000"). One tap pre-fills the modal. Config stored in `settings` store. |
+| **Bill reminders** | Promote the recurring detector from read-only to actionable. Add a "Remind me" toggle per recurring item. On PWA open, show a native `Notification` (requires permission) if a bill is due within 3 days. |
+| **Auto-archive months** | Offer to freeze past months so accidental edits are blocked. Frozen months get a lock icon and are excluded from edit flows. |
+| **Duplicate merge** | Detect near-duplicate transactions (same amount ± 1 day, same merchant) and offer a merge/dismiss UI in the Review Queue. |
+
+---
+
+### Phase 7 — Net Worth & Goals (P1)
+
+| Feature | Detail |
+|---------|--------|
+| **Net worth history** | Snapshot total account balances once per month (on first open of that month). New `snapshots` DB store. New "Net Worth" chart in Reports — line chart over time. |
+| **Savings goals** | Create goals with a name, target amount, and deadline. Link a specific account (e.g. "Trip to Japan — ₹80,000 by Dec 2026 — HDFC Savings"). Dashboard widget shows progress bar + days left. |
+| **Debt tracker** | Track loans and EMIs. Input: principal, rate, tenure. Auto-calculate outstanding balance. Show payoff date and total interest. Link EMI transactions to loan record. |
+| **Investment returns** | For investment-type transactions, add optional fields: instrument (MF/Stock/FD/Gold), units, NAV. Reports → Investments tab shows XIRR estimate. |
+
+---
+
+### Phase 8 — Broader Import Support (P1)
+
+| Bank / Source | Type | Notes |
+|---------------|------|-------|
+| **Kotak Mahindra** | PDF + CSV | Savings + Credit card |
+| **Yes Bank** | PDF + CSV | Savings |
+| **IDFC First** | PDF + CSV | Savings + Credit card |
+| **IndusInd** | PDF + CSV | Savings |
+| **Paytm Payments Bank** | CSV | Savings |
+| **Federal Bank** | PDF + CSV | Savings |
+| **Bank of Baroda / PNB** | PDF | Savings |
+| **SMS / notification parsing** | Text paste | Paste bank SMS alerts; regex extracts amount, merchant, account. Useful when CSV/PDF isn't available. |
+| **UPI app export** | CSV | GPay / PhonePe allow CSV exports; add parsers for their formats. |
+| **Zerodha P&L** | CSV | Import realized gains/losses as investment transactions. |
+
+---
+
+### Phase 9 — Reports & Intelligence (P1)
+
+| Feature | Detail |
+|---------|--------|
+| **Cash flow calendar** | Month calendar view with daily spend dots. Tap a day to see transactions. |
+| **Year-end tax summary** | Aggregate income, investments (80C-eligible), and interest earned into a one-page summary. CSV export. |
+| **FI Health Score** | 0–100 score based on: savings rate (40%), emergency fund coverage (30%), investment rate (20%), budget adherence (10%). Dashboard widget with improvement tips. |
+| **Peer benchmarks** | Anonymised aggregate comparisons ("You spend 20% more on food delivery than the average user"). All computed client-side from the user's own history; no data leaves the device. |
+| **Custom date range** | Reports currently support 1/3/6/12-month windows. Add a custom date picker for arbitrary ranges. |
+| **PDF report export** | Generate a print-ready PDF of any report using the browser's `window.print()` with a print stylesheet. |
+
+---
+
+### Phase 10 — UX & Polish (P0/P1 mix)
+
+| Feature | Effort | Detail |
+|---------|--------|--------|
+| **Undo last transaction** | P0 | Toast after add/delete includes an "Undo" button. 5-second window before committing to DB. |
+| **Bulk transaction edit** | P1 | Long-press to enter multi-select mode in Transactions list. Bulk re-categorise, bulk delete, bulk mark reviewed. |
+| **Transaction notes search** | P0 | Current search covers merchant/description/amount/category. Also match notes field. |
+| **Transfer filter tab** | P0 | Add "Transfers" chip to the Transactions filter row alongside Expenses/Income/Investments. |
+| **Account colour themes** | P0 | Let user pick from 12 preset account card colours (currently only accent colour). |
+| **Swipe to delete** | P1 | Swipe-left gesture on transaction row reveals a delete button (touch-friendly alternative to detail modal). |
+| **Widget / home screen summary** | P2 | PWA doesn't support true widgets, but a "Today at a glance" share image (Canvas → PNG) the user can screenshot. |
+
+---
+
+### Phase 11 — Backup & Sync (P2)
+
+All options preserve the offline-first principle — no mandatory cloud dependency.
+
+| Option | Detail |
+|--------|--------|
+| **Encrypted export file** | Extend the current JSON export with AES-256-GCM encryption (password-derived key via PBKDF2). Import flow decrypts before parsing. |
+| **iCloud / Google Drive backup** | Use the File System Access API or Share API to write the backup JSON to a cloud-synced folder (user picks the destination). No OAuth needed — the OS handles cloud sync. |
+| **QR code sync** | For moving data between two devices on the same WiFi: encode the DB export as a QR stream (chunked). Device B scans and merges. Fully offline. |
+| **Multi-device merge** | Import a backup from another device and run a conflict-resolution diff (last-write-wins per record, with a manual review queue for true conflicts). |
+
+---
+
+### Phase 12 — Splitwise-Level Social (P2)
+
+For households or couples tracking shared finances.
+
+| Feature | Detail |
+|---------|--------|
+| **Shared expense split** | On any transaction, tap "Split with…" → enter name + share (% or fixed). Creates a receivable record. |
+| **Settlement flow** | When the person pays you back, mark the receivable as settled. Links to the incoming UPI transaction. |
+| **Household view** | If two users on the same WiFi import a shared QR backup, show a merged "Household" report (combined net worth, joint spending). |
+
+---
+
+### Technical Debt & Housekeeping
+
+| Item | Priority | Detail |
+|------|----------|--------|
+| Split `index.html` into modules | P2 | At ~6000 lines the file is getting large. Consider a build step (esbuild) that concatenates source modules but still produces a single distributable HTML. |
+| Add Splitwise column-picker persistence | P0 | Store the user's chosen "my name" column in `settings` so re-imports don't re-ask. |
+| `transferGroupId` in detail view | P0 | Transaction detail modal should show "Part of transfer" badge and link to the counterpart transaction. |
+| Budget validation | P0 | `setBudget()` should reject negative or zero values with a toast instead of silently saving. |
+| Reviewed → unreviewed | P0 | Add a "Mark as unreviewed" option in the transaction detail modal so mistakes can be corrected. |
+| Service worker cache version | P1 | Bump cache version when making significant updates so stale assets are evicted. |
+| iOS Safari PWA back-gesture | P1 | The bottom nav doesn't respond to iOS swipe-back. Intercept `popstate` or use a history stack. |
