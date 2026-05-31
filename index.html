@@ -3481,12 +3481,12 @@ const PDFParser = (() => {
 
   // Extract structured rows [{y, page, items:[{str,x,w}], text}] from all pages
   async function _getRows(file) {
-    const data = await file.arrayBuffer();
     let password = undefined;
 
     while (true) {
       try {
-        const pdf = await pdfjsLib.getDocument({ data, password }).promise;
+        // Read a fresh ArrayBuffer each attempt — getDocument transfers (detaches) it to the worker
+        const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer(), password }).promise;
         const all = [];
         for (let p = 1; p <= pdf.numPages; p++) {
           const page = await pdf.getPage(p);
@@ -5821,20 +5821,22 @@ App.boot();
 
 <script>
 if ('serviceWorker' in navigator) {
+  // Must be registered immediately — controllerchange can fire before or during the load event
+  // if skipWaiting + clients.claim() completes before load finishes
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    window.location.reload();
+  });
+
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('./service-worker.js')
       .then(reg => {
-        // Re-check for updates whenever the app is foregrounded (e.g. switching back from another app)
+        // Force-check for a new SW on every load, and again whenever the app is foregrounded
+        reg.update();
         document.addEventListener('visibilitychange', () => {
           if (document.visibilityState === 'visible') reg.update();
         });
       })
       .catch(err => console.log('SW registration failed:', err));
-
-    // When a new service worker takes control, reload to load the fresh cached files
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-      window.location.reload();
-    });
   });
 }
 </script>
