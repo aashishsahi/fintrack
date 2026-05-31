@@ -1091,6 +1091,209 @@ const Utils = (() => {
 
 
 /* ═══════════════════════════════════════════════
+   PARSE METRICS
+   Granular diagnostics for PDF/CSV parser debugging.
+   Toggle in Settings › Developer Tools.
+   NO financial data is stored — amounts are never
+   logged; descriptions are replaced with char-counts;
+   dates are truncated to YYYY-MM.
+═══════════════════════════════════════════════ */
+const ParseMetrics = (() => {
+  const STORAGE_KEY  = 'ft_parse_metrics';
+  const ENABLED_KEY  = 'ft_metrics_on';
+  const MAX_SESSIONS = 40;
+
+  let _on  = false;   // runtime flag
+  let _cur = null;    // session being recorded
+
+  // ── persistence ──────────────────────────────
+  function _persist(session) {
+    try {
+      const arr = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+      arr.push(session);
+      if (arr.length > MAX_SESSIONS) arr.splice(0, arr.length - MAX_SESSIONS);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
+    } catch { /* storage full */ }
+  }
+
+  // ── enable / disable ─────────────────────────
+  function isEnabled() { return _on; }
+  function setEnabled(v) {
+    _on = !!v;
+    try { localStorage.setItem(ENABLED_KEY, _on ? '1' : '0'); } catch {}
+  }
+  function loadSavedState() {
+    try { _on = localStorage.getItem(ENABLED_KEY) === '1'; } catch {}
+  }
+
+  // ── session lifecycle ─────────────────────────
+  function startSession(filename, fileSizeBytes, fileType) {
+    if (!_on) return;
+    _cur = {
+      id:         Date.now().toString(36) + Math.random().toString(36).slice(2,5),
+      ts:         new Date().toISOString(),
+      file:       { name: filename, sizeKB: Math.round(fileSizeBytes / 1024), type: fileType },
+      // PDF phases (populated during parse)
+      extraction: null,   // text extraction stats
+      headerScan: [],     // every row that scored ≥ 1
+      tables:     [],     // one entry per detected table section
+      csvInfo:    null,   // set for CSV files
+      result:     null,
+      errors:     [],
+    };
+  }
+
+  function endSession() {
+    if (!_on || !_cur) return;
+    _cur.durationMs = Date.now() - new Date(_cur.ts).getTime();
+    _persist({ ..._cur });
+    _cur = null;
+  }
+
+  // ── PDF: text extraction ──────────────────────
+  // Called once after PDFjs finishes extracting all pages.
+  // rowsPerPage: number[] — row count for each page.
+  function logExtraction(pages, rowsPerPage) {
+    if (!_on || !_cur) return;
+    _cur.extraction = {
+      pages,
+      totalRows: rowsPerPage.reduce((a, b) => a + b, 0),
+      rowsPerPage,
+      yTolerance: 3,   // pt — the bucket grouping tolerance used
+    };
+  }
+
+  // ── PDF: header-row scan ──────────────────────
+  // Called for every row where _headerScore returns > 0,
+  // plus the first 5 rows of the doc (baseline visibility).
+  // itemTypes: classified type string per PDF text item — NOT the actual text.
+  // accepted: did this row get pushed to headerIdxs?
+  // rejectReason: why it was skipped if !accepted.
+  function logRowScore(rowIdx, itemTypes, score, hasDate, hasMoney, accepted, rejectReason) {
+    if (!_on || !_cur) return;
+    _cur.headerScan.push({
+      rowIdx, itemTypes, score, hasDate, hasMoney,
+      accepted: !!accepted,
+      rejectReason: rejectReason || null,
+      // e.g. 'below-threshold' | 'no-date' | 'no-money' | 'gap-too-small'
+    });
+  }
+
+  // ── PDF: table section ────────────────────────
+  // Called once per detected table header with the resolved column layout.
+  // colLayout: [{ name (header text, safe), type, xCenter }]
+  function startTable(headerIdx, colLayout) {
+    if (!_on || !_cur) return;
+    const t = {
+      headerIdx,
+      cols: colLayout.map(c => ({ name: c.name, type: c.type, xCenter: Math.round(c.xCenter) })),
+      dataRowsScanned:   0,
+      skipped:           { noDatePattern: 0, dateParseFailure: 0, noAmount: 0, emptyDesc: 0 },
+      extracted:         0,
+      amtSources:        { directCol: 0, fallbackUnknownCol: 0 },
+      directionSources:  { amtSuffix: 0, drcrCol: 0, creditColFallback: 0, debitColVal: 0, rowText: 0 },
+      typeCounts:        { expense: 0, income: 0 },
+      monthRange:        { earliest: null, latest: null },  // YYYY-MM only
+    };
+    _cur.tables.push(t);
+  }
+
+  function _tbl() {
+    return _cur && _cur.tables.length ? _cur.tables[_cur.tables.length - 1] : null;
+  }
+
+  // ── PDF: per-row events ───────────────────────
+  function logSkip(reason) {
+    if (!_on || !_cur) return;
+    const t = _tbl(); if (!t) return;
+    t.dataRowsScanned++;
+    if (reason in t.skipped) t.skipped[reason]++;
+  }
+
+  // amtSource: 'directCol' | 'fallbackUnknownCol'
+  // dirSources: string[] of which checks fired (can be multiple)
+  // dateISO: full ISO date — we store only YYYY-MM
+  function logExtracted(type, dateISO, amtSource, dirSources) {
+    if (!_on || !_cur) return;
+    const t = _tbl(); if (!t) return;
+    t.dataRowsScanned++;
+    t.extracted++;
+    t.amtSources[amtSource] = (t.amtSources[amtSource] || 0) + 1;
+    for (const s of (dirSources || [])) {
+      t.directionSources[s] = (t.directionSources[s] || 0) + 1;
+    }
+    t.typeCounts[type]++;
+    const ym = dateISO ? dateISO.slice(0, 7) : null;
+    if (ym) {
+      if (!t.monthRange.earliest || ym < t.monthRange.earliest) t.monthRange.earliest = ym;
+      if (!t.monthRange.latest   || ym > t.monthRange.latest)   t.monthRange.latest   = ym;
+    }
+  }
+
+  // ── PDF: generic fallback ─────────────────────
+  function logGenericFallback(rowsScanned, txnsFound) {
+    if (!_on || !_cur) return;
+    _cur.genericFallback = { rowsScanned, txnsFound };
+  }
+
+  // ── PDF/CSV: final result ─────────────────────
+  function logResult(bank, stmtType, totalTxns, parserPath, errorMsg) {
+    if (!_on || !_cur) return;
+    _cur.result = { bank, stmtType, totalTxns, parserPath, error: errorMsg || null };
+  }
+
+  function logError(msg) {
+    if (!_on || !_cur) return;
+    _cur.errors.push({ ts: new Date().toISOString(), msg: String(msg) });
+  }
+
+  // ── CSV ───────────────────────────────────────
+  function logCSV(hdrs, bankDetected, stmtType, hdrRowIdx, totalRows, totalTxns, errorMsg) {
+    if (!_on || !_cur) return;
+    _cur.csvInfo = {
+      headerRowIdx: hdrRowIdx,
+      headers:      hdrs,   // column names — not financial data
+      bankDetected,
+      stmtType,
+      totalDataRows:  totalRows,
+      totalTxns,
+      error:          errorMsg || null,
+    };
+    _cur.result = { bank: bankDetected, stmtType, totalTxns, parserPath: 'csv', error: errorMsg || null };
+  }
+
+  // ── export / manage ───────────────────────────
+  function getSessions() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; }
+  }
+  function sessionCount() { return getSessions().length; }
+
+  function exportJSON() {
+    const blob = new Blob([JSON.stringify(getSessions(), null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `fintrack-parse-debug-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function clearSessions() {
+    try { localStorage.removeItem(STORAGE_KEY); } catch {}
+  }
+
+  return {
+    isEnabled, setEnabled, loadSavedState,
+    startSession, endSession,
+    logExtraction, logRowScore,
+    startTable, logSkip, logExtracted, logGenericFallback,
+    logResult, logError, logCSV,
+    exportJSON, clearSessions, sessionCount,
+  };
+})();
+
+
+/* ═══════════════════════════════════════════════
    DATABASE  (IndexedDB abstraction)
 
    To add a new store in Phase 2, simply add its
@@ -2685,6 +2888,40 @@ Screens.settings = {
       </div>
       <input type="file" id="backup-file-input" accept=".json" style="display:none" onchange="Screens.settings.importBackup(event)">
 
+      <!-- Developer Tools -->
+      <div class="sec-label">Developer Tools</div>
+      <div class="card card-sm" style="padding:0 14px;margin-bottom:16px">
+        <div class="pin-toggle-row" onclick="Screens.settings.toggleMetrics()">
+          <div class="setting-row-icon">🔬</div>
+          <div class="setting-row-body" style="flex:1">
+            <div class="setting-row-title">Parse Diagnostics</div>
+            <div class="setting-row-sub">${ParseMetrics.isEnabled()
+              ? 'On — logs collected on every import (no financial data)'
+              : 'Off — enable to collect import debug logs'}</div>
+          </div>
+          <div class="toggle-track ${ParseMetrics.isEnabled() ? 'on' : ''}">
+            <div class="toggle-thumb"></div>
+          </div>
+        </div>
+        ${ParseMetrics.isEnabled() ? `
+        <div class="setting-row" onclick="Screens.settings.exportMetrics()">
+          <div class="setting-row-icon">📤</div>
+          <div class="setting-row-body">
+            <div class="setting-row-title">Export Diagnostic Log</div>
+            <div class="setting-row-sub">${ParseMetrics.sessionCount()} session${ParseMetrics.sessionCount() !== 1 ? 's' : ''} stored · header scores · column layout · row-skip reasons</div>
+          </div>
+          <div class="setting-row-right">›</div>
+        </div>
+        <div class="setting-row" onclick="Screens.settings.clearMetrics()">
+          <div class="setting-row-icon">🗑️</div>
+          <div class="setting-row-body">
+            <div class="setting-row-title" style="color:var(--rd)">Clear Diagnostic Logs</div>
+            <div class="setting-row-sub">${ParseMetrics.sessionCount()} session${ParseMetrics.sessionCount() !== 1 ? 's' : ''} · cannot be undone</div>
+          </div>
+          <div class="setting-row-right" style="color:var(--rd)">›</div>
+        </div>` : ''}
+      </div>
+
       <!-- Roadmap -->
       <div class="sec-label">Coming Next</div>
       <div class="card" style="padding:14px 16px">
@@ -2709,6 +2946,25 @@ Screens.settings = {
 
       <div class="bottom-space"></div>
     `;
+  },
+
+  toggleMetrics() {
+    ParseMetrics.setEnabled(!ParseMetrics.isEnabled());
+    UI.toast(ParseMetrics.isEnabled() ? 'Parse diagnostics enabled' : 'Parse diagnostics disabled');
+    this.render();
+  },
+
+  exportMetrics() {
+    if (ParseMetrics.sessionCount() === 0) return UI.toast('No sessions recorded yet — upload a file first', 'error');
+    ParseMetrics.exportJSON();
+    UI.toast('Diagnostic log exported');
+  },
+
+  clearMetrics() {
+    if (!confirm(`Clear ${ParseMetrics.sessionCount()} diagnostic session(s)?`)) return;
+    ParseMetrics.clearSessions();
+    UI.toast('Diagnostic logs cleared');
+    this.render();
   },
 
   async exportBackup() {
@@ -3532,16 +3788,23 @@ const BankParser = (() => {
   // ─── Public API ──────────────────────────────────────────
   function parse(fileText) {
     const allRows = tokeniseCSV(fileText);
-    if (allRows.length < 2) return { error: 'File appears empty or unreadable.', txns: [] };
+    if (allRows.length < 2) {
+      ParseMetrics.logCSV([], 'Unknown', 'unknown', -1, 0, 0, 'File appears empty or unreadable.');
+      return { error: 'File appears empty or unreadable.', txns: [] };
+    }
 
     const hdrIdx = findHeaderRow(allRows);
     const hdrs   = allRows[hdrIdx];
     const data   = allRows.slice(hdrIdx + 1).filter(r => r.some(c => c.trim()));
-    if (data.length === 0) return { error: 'No data rows found after header.', txns: [] };
+    if (data.length === 0) {
+      ParseMetrics.logCSV(hdrs, 'Unknown', 'unknown', hdrIdx, 0, 0, 'No data rows found after header.');
+      return { error: 'No data rows found after header.', txns: [] };
+    }
 
     const det  = detectBank(hdrs);
     const txns = det.parseFn(data, hdrs).filter(t => t.date && t.amount > 0 && t.description.length > 0);
 
+    ParseMetrics.logCSV(hdrs, det.bank, det.stmtType, hdrIdx, data.length, txns.length, null);
     return { bank: det.bank, stmtType: det.stmtType, txns, total: txns.length };
   }
 
@@ -3602,6 +3865,7 @@ const PDFParser = (() => {
         // Read a fresh ArrayBuffer each attempt — getDocument transfers (detaches) it to the worker
         const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer(), password }).promise;
         const all = [];
+        const rowsPerPage = [];
         for (let p = 1; p <= pdf.numPages; p++) {
           const page = await pdf.getPage(p);
           const tc   = await page.getTextContent();
@@ -3625,8 +3889,10 @@ const PDFParser = (() => {
               return { y, page: p, items: sorted, text: sorted.map(i => i.str).join(' ') };
             })
             .filter(r => r.text.trim().length > 0);
+          rowsPerPage.push(rows.length);
           all.push(...rows);
         }
+        ParseMetrics.logExtraction(pdf.numPages, rowsPerPage);
         return all;
       } catch (e) {
         if (e.name === 'PasswordException') {
@@ -3685,7 +3951,7 @@ const PDFParser = (() => {
     { type: 'description', re: /\b(?:description|narration|particular|detail|merchant|remark|payee|beneficiar)/i },
     { type: 'debit',       re: /\b(?:debit|withdrawal|dr)\b/i },
     { type: 'credit',      re: /\b(?:credit|deposit|cr)\b/i },
-    { type: 'amount',      re: /\b(?:amount|amt)\b/i },
+    { type: 'amount',      re: /\b(?:amount|amt|inr)\b/i },
     { type: 'balance',     re: /\b(?:balance|bal)\b/i },
   ];
   const _COL_IGNORE_RE = /\b(?:cheque|chq|reward|points?|pts|ifsc|utr|sr\.?\s*no|s\.?\s*no|sl\.?\s*no|ref\.?\s*no)\b/i;
@@ -3698,13 +3964,15 @@ const PDFParser = (() => {
 
   function _headerScore(row) {
     const USEFUL = new Set(['date','description','debit','credit','amount']);
-    let score = 0;
+    let score = 0, hasDate = false, hasMoney = false;
     for (const it of row.items) {
       const t = _classifyColType(it.str);
       if (USEFUL.has(t)) score += 2;
       else if (t !== 'unknown') score += 1;
+      if (t === 'date') hasDate = true;
+      if (t === 'debit' || t === 'credit' || t === 'amount' || t === 'drcr') hasMoney = true;
     }
-    return score;
+    return (hasDate && hasMoney) ? score : 0;
   }
 
   // Build typed column descriptors. If no explicit description column exists,
@@ -3731,13 +3999,51 @@ const PDFParser = (() => {
   function _parseTable(rows) {
     const THRESHOLD = 4;
     const headerIdxs = [];
+
     for (let i = 0; i < rows.length; i++) {
-      const s = _headerScore(rows[i]);
-      // New header only if above threshold AND at least 10 rows after the previous one
-      if (s >= THRESHOLD && (!headerIdxs.length || i - headerIdxs[headerIdxs.length-1] > 10))
-        headerIdxs.push(i);
+      const row = rows[i];
+      const itemTypes = row.items.map(it => _classifyColType(it.str));
+      const hasDate  = itemTypes.includes('date');
+      const hasMoney = ['debit','credit','amount','drcr'].some(t => itemTypes.includes(t));
+
+      // _headerScore returns 0 when date+money requirement not met (masked by the guard)
+      let score = 0;
+      if (hasDate && hasMoney) {
+        const USEFUL = new Set(['date','description','debit','credit','amount']);
+        for (const t of itemTypes) {
+          if (USEFUL.has(t)) score += 2;
+          else if (t !== 'unknown' && t !== 'ignore') score += 1;
+        }
+      }
+
+      const prevHi = headerIdxs.length ? headerIdxs[headerIdxs.length - 1] : -Infinity;
+      const gapOk  = i - prevHi > 15;
+      const accepted = score >= THRESHOLD && gapOk;
+
+      // Log rows that have any relevant keyword (score > 0) — these are the interesting candidates.
+      // Also log the first 8 rows unconditionally so the doc preamble is always visible.
+      if (ParseMetrics.isEnabled() && (score > 0 || i < 8)) {
+        let rejectReason = null;
+        if (score === 0) {
+          if (!hasDate && !hasMoney) rejectReason = 'no-date-no-money';
+          else if (!hasDate)         rejectReason = 'no-date';
+          else                       rejectReason = 'no-money';
+        } else if (!gapOk) {
+          rejectReason = 'gap-too-small';
+        } else if (score < THRESHOLD) {
+          rejectReason = 'below-threshold';
+        }
+        ParseMetrics.logRowScore(i, itemTypes, score, hasDate, hasMoney, accepted, rejectReason);
+      }
+
+      if (accepted) headerIdxs.push(i);
     }
-    if (!headerIdxs.length) return _genericPDF(rows);
+
+    if (!headerIdxs.length) {
+      const result = _genericPDF(rows);
+      ParseMetrics.logGenericFallback(rows.length, result.length);
+      return result;
+    }
 
     const all = [];
     for (let h = 0; h < headerIdxs.length; h++) {
@@ -3754,16 +4060,26 @@ const PDFParser = (() => {
       const descCols = cols.filter(c => c.type === 'description');
       const drcrCols = cols.filter(c => c.type === 'drcr');
 
+      ParseMetrics.startTable(hi, cols);
+
       for (let i = hi + 1; i < nextHi; i++) {
         const row = rows[i];
-        if (!DATE_LINE_RE.test(row.text)) continue;
+
+        if (!DATE_LINE_RE.test(row.text)) {
+          ParseMetrics.logSkip('noDatePattern');
+          continue;
+        }
+
         const d = _assign(cols, row);
 
         // Date: try each classified date column, fall back to scanning the row text
         let date = null;
         for (const c of dateCols) { date = _pd(d[c.name]); if (date) break; }
         if (!date) { const m = row.text.match(DATE_LINE_RE); date = m ? _pd(m[0]) : null; }
-        if (!date) continue;
+        if (!date) {
+          ParseMetrics.logSkip('dateParseFailure');
+          continue;
+        }
 
         // Description: join classified columns, or strip dates/amounts from the row text
         const desc = descCols.map(c => d[c.name]).filter(Boolean).join(' ').trim()
@@ -3772,23 +4088,70 @@ const PDFParser = (() => {
 
         if (amtCols.length) {
           // Single amount column: Dr/Cr suffix or explicit Dr/Cr column signals direction
-          const amtStr = amtCols.map(c => d[c.name]).find(v => v) || '';
-          const amt    = _pa(amtStr.replace(/[Cc][Rr]|[Dd][Rr]/g, ''));
-          if (!amt) continue;
-          const drCrVal = drcrCols.map(c => d[c.name]).join(' ');
-          const isCr = /\bCr\b/i.test(amtStr) || /\bCr\b/i.test(drCrVal)
-            || /CREDIT|REFUND|REVERSAL|CASHBACK/i.test(row.text);
-          all.push({ date, description: desc, amount: amt, type: isCr ? 'income' : 'expense' });
+          let amtStr = amtCols.map(c => d[c.name]).find(v => v) || '';
+          let amtSource = 'directCol';
+          // Fallback: if classified amount cols are empty, scan unknown cols for a numeric value.
+          // This handles split headers like "Amount" + "(INR)" as separate PDF text items
+          // where numeric values land in the "(INR)" slot which is typed 'unknown'.
+          if (!amtStr) {
+            for (const uc of cols.filter(c => c.type === 'unknown')) {
+              const v = d[uc.name];
+              if (v && /\d+[.,]\d{2}/.test(v)) { amtStr = v; amtSource = 'fallbackUnknownCol'; break; }
+            }
+          }
+          const amt = _pa(amtStr.replace(/[Cc][Rr]|[Dd][Rr]/g, ''));
+          if (!amt) {
+            ParseMetrics.logSkip('noAmount');
+            continue;
+          }
+
+          const drCrVal = drcrCols.map(c => d[c.name]).join(' ')
+            || crCols.map(c => d[c.name]).join(' ');
+          const debitVal = debitCols.map(c => d[c.name]).join(' ');
+
+          const crFromAmtSuffix  = /\bCr\b/i.test(amtStr);
+          const crFromDrCrCol    = /\bCr\b/i.test(drCrVal);
+          const crFromRowText    = /CREDIT|REFUND|REVERSAL|CASHBACK/i.test(row.text);
+          const crFromDebitVal   = /\bCr\b/i.test(debitVal) && !/\bDr\b/i.test(debitVal);
+          const isCr = crFromAmtSuffix || crFromDrCrCol || crFromRowText || crFromDebitVal;
+
+          const type = isCr ? 'income' : 'expense';
+          const dirSources = [];
+          if (crFromAmtSuffix) dirSources.push('amtSuffix');
+          if (crFromDrCrCol)   dirSources.push('drcrCol');
+          if (crFromRowText)   dirSources.push('rowText');
+          if (crFromDebitVal)  dirSources.push('debitColVal');
+          if (!isCr)           dirSources.push('defaultDebit');
+
+          ParseMetrics.logExtracted(type, date, amtSource, dirSources);
+          all.push({ date, description: desc, amount: amt, type });
+
         } else {
           // Separate debit / credit columns
           const dr = debitCols.reduce((a, c) => a || _pa(d[c.name]), null);
-          const cr = crCols.reduce((a, c) => a || _pa(d[c.name]), null);
-          if (dr && dr > 0) all.push({ date, description: desc, amount: dr, type: 'expense' });
-          if (cr && cr > 0) all.push({ date, description: desc, amount: cr, type: 'income' });
+          const cr = crCols.reduce((a, c)    => a || _pa(d[c.name]), null);
+          if (!dr && !cr) {
+            ParseMetrics.logSkip('noAmount');
+            continue;
+          }
+          if (dr && dr > 0) {
+            ParseMetrics.logExtracted('expense', date, 'directCol', ['debitCol']);
+            all.push({ date, description: desc, amount: dr, type: 'expense' });
+          }
+          if (cr && cr > 0) {
+            ParseMetrics.logExtracted('income', date, 'directCol', ['creditCol']);
+            all.push({ date, description: desc, amount: cr, type: 'income' });
+          }
         }
       }
     }
-    return all.length ? all : _genericPDF(rows);
+
+    if (!all.length) {
+      const result = _genericPDF(rows);
+      ParseMetrics.logGenericFallback(rows.length, result.length);
+      return result;
+    }
+    return all;
   }
 
   // ─── Bank + statement-type detection ───────────────────
@@ -3838,19 +4201,31 @@ const PDFParser = (() => {
   // ─── Public API ────────────────────────────────────────
   async function parse(file) {
     try { await _load(); }
-    catch { return { error: 'Could not load PDF library. Check your internet connection and try again.', txns: [] }; }
+    catch (e) {
+      ParseMetrics.logError('PDF.js load failed: ' + e.message);
+      ParseMetrics.logResult('Unknown', 'unknown', 0, 'pdf', 'PDF library load failed');
+      return { error: 'Could not load PDF library. Check your internet connection and try again.', txns: [] };
+    }
 
     let rows;
     try { rows = await _getRows(file); }
     catch (e) {
       if (e.message === 'cancelled') return { cancelled: true, txns: [] };
+      ParseMetrics.logError('_getRows: ' + e.message);
+      ParseMetrics.logResult('Unknown', 'unknown', 0, 'pdf', 'Could not read PDF: ' + e.message);
       return { error: 'Could not read PDF: ' + e.message, txns: [] };
     }
 
-    if (!rows.length) return { error: 'PDF has no extractable text. Scanned/image PDFs are not supported — please use a digital statement PDF.', txns: [] };
+    if (!rows.length) {
+      ParseMetrics.logResult('Unknown', 'unknown', 0, 'pdf', 'No extractable text');
+      return { error: 'PDF has no extractable text. Scanned/image PDFs are not supported — please use a digital statement PDF.', txns: [] };
+    }
 
     const det  = _detect(rows);
-    const txns = _parseTable(rows).filter(t => t.date && t.amount > 0 && t.description.trim().length > 0);
+    const raw  = _parseTable(rows);
+    const txns = raw.filter(t => t.date && t.amount > 0 && t.description.trim().length > 0);
+
+    ParseMetrics.logResult(det.bank, det.stmtType, txns.length, 'pdf-table', null);
     return { bank: det.bank, stmtType: det.stmtType, txns, total: txns.length };
   }
 
@@ -3953,9 +4328,12 @@ Screens.import = {
 
     try {
       const isPDF  = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+      ParseMetrics.startSession(file.name, file.size, isPDF ? 'pdf' : 'csv');
       const result = isPDF
         ? await PDFParser.parse(file)
         : BankParser.parse(await file.text());
+
+      ParseMetrics.endSession();
 
       if (result.cancelled) { this.render(); return; }
       if (result.error || result.txns.length === 0) {
@@ -3983,6 +4361,8 @@ Screens.import = {
       this._renderPreview();
 
     } catch (err) {
+      ParseMetrics.logError('Uncaught: ' + err.message);
+      ParseMetrics.endSession();
       UI.toast('Parse error: ' + err.message, 'error');
       console.error(err);
       this.render();
@@ -5742,6 +6122,7 @@ const App = {
 
   async boot() {
     try {
+      ParseMetrics.loadSavedState();
       await DB.open();
       await State.refresh();
 
