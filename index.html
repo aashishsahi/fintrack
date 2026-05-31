@@ -5756,7 +5756,18 @@ App.boot();
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('./service-worker.js')
+      .then(reg => {
+        // Re-check for updates whenever the app is foregrounded (e.g. switching back from another app)
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'visible') reg.update();
+        });
+      })
       .catch(err => console.log('SW registration failed:', err));
+
+    // When a new service worker takes control, reload to load the fresh cached files
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      window.location.reload();
+    });
   });
 }
 </script>
