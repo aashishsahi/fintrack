@@ -951,6 +951,32 @@ canvas { display: block; }
   </div>
 </div>
 
+<!-- PDF Password Modal -->
+<div class="modal-overlay" id="modal-pdfpw">
+  <div class="modal-sheet">
+    <div class="modal-handle"></div>
+    <div class="modal-hdr">
+      <div class="modal-title">Password Protected PDF</div>
+      <div class="icon-btn" onclick="PDFParser._pwCancel()">
+        <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div style="font-size:13px;color:var(--tx2);margin-bottom:16px" id="pdfpw-filename"></div>
+      <div id="pdfpw-error" style="display:none;font-size:13px;color:var(--neg);margin-bottom:12px;font-weight:600">Incorrect password — try again.</div>
+      <div class="form-group">
+        <label class="form-label">Password</label>
+        <input class="form-input" id="pdfpw-input" type="password" placeholder="Enter PDF password"
+               onkeydown="if(event.key==='Enter')PDFParser._pwSubmit()">
+      </div>
+      <button class="btn btn-primary btn-full" onclick="PDFParser._pwSubmit()">Unlock</button>
+      <div style="height:8px"></div>
+      <button class="btn btn-full" style="background:var(--s2);color:var(--tx1)" onclick="PDFParser._pwCancel()">Cancel</button>
+      <div style="height:12px"></div>
+    </div>
+  </div>
+</div>
+
 <!-- Toast container -->
 <div id="toast-root"></div>
 
@@ -3430,36 +3456,73 @@ const PDFParser = (() => {
     _libLoaded = true;
   }
 
+  // Promise handles for the password modal
+  let _pwResolve = null, _pwReject = null;
+
+  function _promptPassword(filename, isRetry) {
+    document.getElementById('pdfpw-filename').textContent = filename;
+    document.getElementById('pdfpw-error').style.display = isRetry ? '' : 'none';
+    document.getElementById('pdfpw-input').value = '';
+    document.getElementById('modal-pdfpw').classList.add('open');
+    setTimeout(() => document.getElementById('pdfpw-input').focus(), 300);
+    return new Promise((res, rej) => { _pwResolve = res; _pwReject = rej; });
+  }
+
+  function _pwSubmit() {
+    const pw = document.getElementById('pdfpw-input').value;
+    document.getElementById('modal-pdfpw').classList.remove('open');
+    if (_pwResolve) { _pwResolve(pw); _pwResolve = _pwReject = null; }
+  }
+
+  function _pwCancel() {
+    document.getElementById('modal-pdfpw').classList.remove('open');
+    if (_pwReject) { _pwReject(new Error('cancelled')); _pwResolve = _pwReject = null; }
+  }
+
   // Extract structured rows [{y, page, items:[{str,x,w}], text}] from all pages
   async function _getRows(file) {
-    const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
-    const all = [];
-    for (let p = 1; p <= pdf.numPages; p++) {
-      const page = await pdf.getPage(p);
-      const tc   = await page.getTextContent();
-      const items = tc.items
-        .filter(i => i.str && i.str.trim())
-        .map(i => ({ str: i.str.trim(), x: i.transform[4], y: i.transform[5], w: i.width || 0 }));
+    const data = await file.arrayBuffer();
+    let password = undefined;
 
-      // Group items into rows by y-coordinate (±3pt tolerance)
-      const buckets = new Map();
-      for (const it of items) {
-        let key = null;
-        for (const k of buckets.keys()) { if (Math.abs(k - it.y) <= 3) { key = k; break; } }
-        if (key === null) { key = it.y; buckets.set(key, []); }
-        buckets.get(key).push(it);
+    while (true) {
+      try {
+        const pdf = await pdfjsLib.getDocument({ data, password }).promise;
+        const all = [];
+        for (let p = 1; p <= pdf.numPages; p++) {
+          const page = await pdf.getPage(p);
+          const tc   = await page.getTextContent();
+          const items = tc.items
+            .filter(i => i.str && i.str.trim())
+            .map(i => ({ str: i.str.trim(), x: i.transform[4], y: i.transform[5], w: i.width || 0 }));
+
+          // Group items into rows by y-coordinate (±3pt tolerance)
+          const buckets = new Map();
+          for (const it of items) {
+            let key = null;
+            for (const k of buckets.keys()) { if (Math.abs(k - it.y) <= 3) { key = k; break; } }
+            if (key === null) { key = it.y; buckets.set(key, []); }
+            buckets.get(key).push(it);
+          }
+
+          const rows = [...buckets.entries()]
+            .sort(([a], [b]) => b - a)   // descending y = top-to-bottom
+            .map(([y, its]) => {
+              const sorted = [...its].sort((a, b) => a.x - b.x);
+              return { y, page: p, items: sorted, text: sorted.map(i => i.str).join(' ') };
+            })
+            .filter(r => r.text.trim().length > 0);
+          all.push(...rows);
+        }
+        return all;
+      } catch (e) {
+        if (e.name === 'PasswordException') {
+          // isRetry = true when we already tried a password and it was wrong
+          password = await _promptPassword(file.name, password !== undefined);
+        } else {
+          throw e;
+        }
       }
-
-      const rows = [...buckets.entries()]
-        .sort(([a], [b]) => b - a)   // descending y = top-to-bottom
-        .map(([y, its]) => {
-          const sorted = [...its].sort((a, b) => a.x - b.x);
-          return { y, page: p, items: sorted, text: sorted.map(i => i.str).join(' ') };
-        })
-        .filter(r => r.text.trim().length > 0);
-      all.push(...rows);
     }
-    return all;
   }
 
   // ─── Parsers for date / amount strings ────────────────
@@ -3759,7 +3822,10 @@ const PDFParser = (() => {
 
     let rows;
     try { rows = await _getRows(file); }
-    catch (e) { return { error: 'Could not read PDF: ' + e.message, txns: [] }; }
+    catch (e) {
+      if (e.message === 'cancelled') return { cancelled: true, txns: [] };
+      return { error: 'Could not read PDF: ' + e.message, txns: [] };
+    }
 
     if (!rows.length) return { error: 'PDF has no extractable text. Scanned/image PDFs are not supported — please use a digital statement PDF.', txns: [] };
 
@@ -3768,7 +3834,7 @@ const PDFParser = (() => {
     return { bank: det.bank, stmtType: det.stmtType, txns, total: txns.length };
   }
 
-  return { parse };
+  return { parse, _pwSubmit, _pwCancel };
 })();
 
 
@@ -3870,6 +3936,7 @@ Screens.import = {
         ? await PDFParser.parse(file)
         : BankParser.parse(await file.text());
 
+      if (result.cancelled) { this.render(); return; }
       if (result.error || result.txns.length === 0) {
         UI.toast(result.error || 'No transactions found in file', 'error');
         this.render(); return;
