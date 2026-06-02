@@ -3906,16 +3906,31 @@ const PDFParser = (() => {
   }
 
   // ─── Parsers for date / amount strings ────────────────
-  const MO = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+  const MO = {
+    jan:'01',january:'01',feb:'02',february:'02',mar:'03',march:'03',
+    apr:'04',april:'04',may:'05',jun:'06',june:'06',jul:'07',july:'07',
+    aug:'08',august:'08',sep:'09',sept:'09',september:'09',oct:'10',october:'10',
+    nov:'11',november:'11',dec:'12',december:'12'
+  };
   function _pd(s) {
     if (!s) return null;
-    s = String(s).trim();
+    s = String(s).trim().replace(/\s+/g, ' ');
     let m;
-    m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
-    if (m) { const y = m[3].length === 2 ? '20'+m[3] : m[3]; return `${y}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`; }
-    m = s.match(/^(\d{1,2})[\s\-]([A-Za-z]{3})[\s\-](\d{2,4})$/);
-    if (m) { const mo = MO[m[2].toLowerCase()]; if (mo) { const y = m[3].length === 2 ? '20'+m[3] : m[3]; return `${y}-${mo}-${m[1].padStart(2,'0')}`; } }
-    m = s.match(/^([A-Za-z]{3})\s+(\d{1,2})[,\s]+(\d{4})$/);
+    // ISO: YYYY-MM-DD
+    m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+    if (m) return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
+    // Numeric with any separator (/, -, .): DD/MM/YYYY — if second part >12 try MM/DD swap
+    m = s.match(/^(\d{1,2})\s*[\/\-\.]\s*(\d{1,2})\s*[\/\-\.]\s*(\d{2,4})$/);
+    if (m) {
+      const d1 = +m[1], d2 = +m[2], yr = m[3].length === 2 ? '20'+m[3] : m[3];
+      if (d2 >= 1 && d2 <= 12 && d1 >= 1 && d1 <= 31) return `${yr}-${String(d2).padStart(2,'0')}-${String(d1).padStart(2,'0')}`;
+      if (d1 >= 1 && d1 <= 12 && d2 >= 1 && d2 <= 31) return `${yr}-${String(d1).padStart(2,'0')}-${String(d2).padStart(2,'0')}`;
+    }
+    // Named month, day-first: 31-May-2026 / 31 May 2026 / 31 January 2026
+    m = s.match(/^(\d{1,2})[\s\-\/,]+([A-Za-z]{3,9})[\s\-\/,]+(\d{2,4})$/);
+    if (m) { const mo = MO[m[2].toLowerCase()]; if (mo) { const yr = m[3].length === 2 ? '20'+m[3] : m[3]; return `${yr}-${mo}-${m[1].padStart(2,'0')}`; } }
+    // Named month, month-first: May 31, 2026 / January 31 2026
+    m = s.match(/^([A-Za-z]{3,9})[\s\-\/,]+(\d{1,2})[\s\-\/,]+(\d{4})$/);
     if (m) { const mo = MO[m[1].toLowerCase()]; if (mo) return `${m[3]}-${mo}-${m[2].padStart(2,'0')}`; }
     return null;
   }
@@ -3941,12 +3956,14 @@ const PDFParser = (() => {
     return r;
   }
 
-  const DATE_LINE_RE = /\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b|\b\d{1,2}[\s\-][A-Za-z]{3}[\s\-]\d{2,4}\b/;
+  // Matches any recognisable date token in a row of text.
+  // Used as a fast scan when no dedicated date column is available.
+  const DATE_LINE_RE = /\b\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2}\b|\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b|\b\d{1,2}[\s\-][A-Za-z]{3,9}[\s\-]\d{2,4}\b|\b[A-Za-z]{3,9}\s+\d{1,2}[\s,]+\d{4}\b/;
 
   // ─── Generic table engine ──────────────────────────────
   // drcr listed first so "DR/CR" columns don't accidentally match as debit or credit
   const _COL_TYPES = [
-    { type: 'drcr',        re: /dr\s*\/\s*cr|cr\s*\/\s*dr/i },
+    { type: 'drcr',        re: /dr\s*\/\s*cr|cr\s*\/\s*dr|debit\s*\/\s*credit|credit\s*\/\s*debit/i },
     { type: 'date',        re: /\bdate\b|\bdt\b/i },
     { type: 'description', re: /\b(?:description|narration|particular|detail|merchant|remark|payee|beneficiar)/i },
     { type: 'debit',       re: /\b(?:debit|withdrawal|dr)\b/i },
@@ -3958,6 +3975,9 @@ const PDFParser = (() => {
 
   function _classifyColType(name) {
     if (_COL_IGNORE_RE.test(name)) return 'ignore';
+    // Reject key:value strings like "DATE: 31/05/2026" or "CREDIT CARD NUMBER: 4111..."
+    // These are summary/footer rows that accidentally contain column-type keywords.
+    if (/:\s*\S/.test(name)) return 'unknown';
     for (const { type, re } of _COL_TYPES) { if (re.test(name)) return type; }
     return 'unknown';
   }
@@ -4062,22 +4082,49 @@ const PDFParser = (() => {
 
       ParseMetrics.startTable(hi, cols);
 
+      // Carry-forward date for grouped-date layouts: some PDFs print the date once
+      // on a standalone row and leave the date cell empty for subsequent transactions
+      // in that group (e.g. Axis Bank CC statements).
+      let carryDate = null;
+
       for (let i = hi + 1; i < nextHi; i++) {
         const row = rows[i];
-
-        if (!DATE_LINE_RE.test(row.text)) {
-          ParseMetrics.logSkip('noDatePattern');
-          continue;
-        }
-
         const d = _assign(cols, row);
 
-        // Date: try each classified date column, fall back to scanning the row text
+        // ── Date resolution ────────────────────────────────────────────────
+        // When a date column is known, trust it instead of pre-filtering by
+        // row text. This handles:
+        //   1. Any date format not covered by DATE_LINE_RE.
+        //   2. Grouped-date layouts where the date cell is intentionally empty
+        //      for rows that share the most-recently-seen date (carry-forward).
         let date = null;
-        for (const c of dateCols) { date = _pd(d[c.name]); if (date) break; }
-        if (!date) { const m = row.text.match(DATE_LINE_RE); date = m ? _pd(m[0]) : null; }
+        let dateColHadContent = false;
+
+        if (dateCols.length) {
+          for (const c of dateCols) {
+            const v = (d[c.name] || '').trim();
+            if (v) { dateColHadContent = true; date = _pd(v); if (date) break; }
+          }
+          if (!date && !dateColHadContent) {
+            // Date cell empty → grouped layout, inherit the last parsed date
+            date = carryDate;
+          } else if (!date) {
+            // Column had text but _pd couldn't parse it → try full row scan as last resort
+            const mx = row.text.match(DATE_LINE_RE);
+            if (mx) date = _pd(mx[0]);
+          }
+        } else {
+          // No classified date column → require a date token somewhere in the row
+          if (!DATE_LINE_RE.test(row.text)) { ParseMetrics.logSkip('noDatePattern'); continue; }
+          const mx = row.text.match(DATE_LINE_RE);
+          date = mx ? _pd(mx[0]) : null;
+        }
+
+        // Refresh carry-date whenever this row's own date column produced a date
+        if (date && dateColHadContent) carryDate = date;
+
         if (!date) {
-          ParseMetrics.logSkip('dateParseFailure');
+          ParseMetrics.logSkip(dateColHadContent ? 'dateParseFailure' : 'noDatePattern');
           continue;
         }
 
@@ -4180,20 +4227,24 @@ const PDFParser = (() => {
   }
 
   // ─── Generic PDF fallback ──────────────────────────────
-  // Finds any row containing a date + amount and treats it as a transaction
+  // Finds any row containing a date + amount and treats it as a transaction.
+  // Also handles grouped-date layouts via carry-forward (date on one row,
+  // amounts on following rows with no date in their text).
   function _genericPDF(rows) {
     const txns = [];
+    let carryDate = null;
     for (const row of rows) {
       const dateMatch = row.text.match(DATE_LINE_RE);
-      if (!dateMatch) continue;
-      const date = _pd(dateMatch[0]);
-      if (!date) continue;
+      const parsedDate = dateMatch ? _pd(dateMatch[0]) : null;
+      if (parsedDate) carryDate = parsedDate;
+      const effectiveDate = parsedDate || carryDate;
+      if (!effectiveDate) continue;
       const amounts = (row.text.match(/[\d,]+\.\d{2}/g) || [])
         .map(m => parseFloat(m.replace(/,/g,'')))
         .filter(v => v > 0);
       if (!amounts.length) continue;
       const desc = row.text.replace(DATE_LINE_RE,'').replace(/[\d,]+\.\d{2}/g,'').trim();
-      txns.push({ date, description: desc || row.text, amount: amounts[0], type:'expense' });
+      txns.push({ date: effectiveDate, description: desc || row.text, amount: amounts[0], type:'expense' });
     }
     return txns;
   }

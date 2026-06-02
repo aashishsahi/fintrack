@@ -1,8 +1,6 @@
 
 const CACHE_NAME = 'fintrack-cache-v3';
-const urlsToCache = [
-  './',
-  './index.html',
+const STATIC_ASSETS = [
   './manifest.json',
   './icon-192.png',
   './icon-512.png',
@@ -13,7 +11,7 @@ const urlsToCache = [
 self.addEventListener('install', event => {
   event.waitUntil(
     caches.open(CACHE_NAME)
-      .then(cache => cache.addAll(urlsToCache))
+      .then(cache => cache.addAll(STATIC_ASSETS))
       .then(() => self.skipWaiting())
   );
 });
@@ -29,8 +27,31 @@ self.addEventListener('activate', event => {
 });
 
 self.addEventListener('fetch', event => {
+  const { request } = event;
+  const url = new URL(request.url);
+
+  // Network-first for same-origin HTML/navigation requests so deployments are
+  // picked up immediately. Falls back to cache only when offline.
+  if (request.mode === 'navigate' || (url.origin === self.location.origin && url.pathname.endsWith('.html'))) {
+    event.respondWith(
+      fetch(request)
+        .then(response => {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(request, clone));
+          return response;
+        })
+        .catch(() => caches.match(request))
+    );
+    return;
+  }
+
+  // Cache-first for static assets (icons, CDN scripts) that don't change.
   event.respondWith(
-    caches.match(event.request)
-      .then(response => response || fetch(event.request))
+    caches.match(request)
+      .then(cached => cached || fetch(request).then(response => {
+        const clone = response.clone();
+        caches.open(CACHE_NAME).then(cache => cache.put(request, clone));
+        return response;
+      }))
   );
 });
